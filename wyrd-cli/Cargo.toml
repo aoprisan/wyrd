@@ -1,0 +1,20 @@
+[package]
+name = "wyrd-cli"
+description = "the `wyrd` CLI: why-blocked and stats over recordings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wyrd"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-core.workspace = true
+wyrd-weave.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+clap.workspace = true

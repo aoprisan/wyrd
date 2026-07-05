@@ -1,0 +1,18 @@
+[package]
+name = "wyrd-demo"
+description = "a tokio app exercising spawn trees, mutex contention, mpsc backpressure and a deadlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wyrd-demo"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-weave.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

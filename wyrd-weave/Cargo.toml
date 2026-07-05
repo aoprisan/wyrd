@@ -1,0 +1,23 @@
+[package]
+name = "wyrd-weave"
+description = "tracing Layer that normalizes tokio's internal instrumentation into a compact causality event stream on disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+# Emit wyrd's own internal diagnostics via `tracing` (meta, ha). Off by default
+# so the instrumentation layer never feeds its own noise back into a subscriber.
+diag = []
+
+[dev-dependencies]
+serde_json.workspace = true
