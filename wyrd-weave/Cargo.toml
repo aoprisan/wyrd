@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokio", "tracing", "async", "debugging", "causality"]
+categories = ["asynchronous", "development-tools::debugging"]
 
 [dependencies]
 serde.workspace = true

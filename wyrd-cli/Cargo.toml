@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokio", "async", "deadlock", "debugging", "cli"]
+categories = ["command-line-utilities", "development-tools::debugging", "asynchronous"]
 
 [[bin]]
 name = "wyrd"

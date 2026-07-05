@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.75"
 repository = "https://github.com/aoprisan/wyrd"
+homepage = "https://github.com/aoprisan/wyrd"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -20,8 +21,10 @@ tracing-subscriber = { version = "0.3", features = ["registry", "std"] }
 tokio = { version = "1.52", features = ["full", "tracing"] }
 clap = { version = "4", features = ["derive"] }
 
-wyrd-weave = { path = "wyrd-weave" }
-wyrd-core = { path = "wyrd-core" }
+# Internal deps carry a version too, so these crates can be published to
+# crates.io (cargo uses `version` for the published dep, `path` for local builds).
+wyrd-weave = { path = "wyrd-weave", version = "0.1.0" }
+wyrd-core = { path = "wyrd-core", version = "0.1.0" }
 
 [profile.release]
 debug = true
