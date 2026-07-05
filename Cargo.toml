@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["wyrd-weave", "wyrd-core", "wyrd-cli", "examples/demo"]
+members = ["wyrd-weave", "wyrd-core", "wyrd-cli", "wyrd-shim", "examples/demo"]
 
 [workspace.package]
 version = "0.1.0"

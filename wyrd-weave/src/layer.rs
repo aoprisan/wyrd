@@ -11,7 +11,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
@@ -20,8 +19,9 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::error::WeaveError;
-use crate::event::{Event, Loc, Record, StateOp, TaskKind, FIELD_ACQUIRED_BY};
-use crate::writer::{spawn_writer, FlushGuard, WriterHandle};
+use crate::event::{Event, Loc, StateOp, TaskKind, FIELD_ACQUIRED_BY};
+use crate::recorder::Recorder;
+use crate::writer::FlushGuard;
 
 thread_local! {
     /// Ids of `runtime.spawn` spans currently entered on this thread, outermost
@@ -104,10 +104,13 @@ impl WeaveLayerBuilder {
     /// Build the layer and its finalization guard.
     pub fn build(self) -> Result<(WeaveLayer, FlushGuard), WeaveError> {
         let path = self.path.ok_or(WeaveError::NoPath)?;
-        let (writer, guard) = spawn_writer(&path, self.queue_capacity, self.batch_size)?;
+        let (recorder, guard) = Recorder::builder()
+            .file(path)
+            .queue_capacity(self.queue_capacity)
+            .batch_size(self.batch_size)
+            .build()?;
         let layer = WeaveLayer {
-            start: Instant::now(),
-            writer,
+            recorder,
             record_waker_clone_drop: self.record_waker_clone_drop,
         };
         Ok((layer, guard))
@@ -127,8 +130,7 @@ impl WeaveLayerBuilder {
 /// tracing_subscriber::registry().with(layer).init();
 /// ```
 pub struct WeaveLayer {
-    start: Instant,
-    writer: WriterHandle,
+    recorder: Recorder,
     record_waker_clone_drop: bool,
 }
 
@@ -139,8 +141,7 @@ impl WeaveLayer {
     }
 
     fn emit(&self, event: Event) {
-        let ts = self.start.elapsed().as_nanos() as u64;
-        self.writer.send(Record { ts, event });
+        self.recorder.emit(event);
     }
 }
 

@@ -15,6 +15,7 @@ naming deadlocks.
 | [`wyrd-weave`](wyrd-weave) | a `tracing_subscriber::Layer` that normalizes tokio's internal spans/events into a compact causality event stream, written to disk on a dedicated writer thread. |
 | [`wyrd-core`](wyrd-core) | ingests recordings into SQLite; world-state fold + `why_blocked` / `stats` queries returning serde structs. |
 | [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>` and `wyrd stats <recording>`. |
+| [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
 
 ## ⚠️ Instrumented apps require `tokio_unstable`
@@ -72,6 +73,42 @@ fn main() {
 
     drop(guard); // flush & finalize the recording
 }
+```
+
+## Two producers, one event vocabulary
+
+The normalized [`wyrd_weave::Event`] stream is the stable interface, so the
+*producer* is swappable:
+
+```
+wyrd-weave  (tokio_unstable tracing Layer) ─┐
+                                            ├─→ Event stream → wyrd-core → wyrd
+wyrd-shim   (stable wrapper types)  ─────────┘
+```
+
+| | `wyrd-weave` (unstable layer) | `wyrd-shim` (stable wrappers) |
+|---|---|---|
+| Requires `tokio_unstable` | **yes** | **no** |
+| Coverage | every task/resource, incl. inside dependencies, zero code changes | only what you route through `wyrd_shim::{spawn, Mutex, mpsc}` |
+| Source locations | from tokio (sometimes missing, e.g. mpsc) | exact `file:line:col` via `#[track_caller]` |
+| Holder signal | inferred from `poll_acquire` readiness | observed directly (try-lock → acquire → guard drop) |
+
+Use the shim when you can't (or won't) enable `tokio_unstable` and are willing
+to swap `tokio::spawn`/`tokio::sync::Mutex`/`tokio::sync::mpsc` for the wyrd
+wrappers; use the layer when you need to see into code you don't control.
+
+```rust
+let _guard = wyrd_shim::init("run.wyrd").unwrap();       // stable, no RUSTFLAGS
+let lock = std::sync::Arc::new(wyrd_shim::Mutex::new(0));
+wyrd_shim::spawn(async move { /* ... */ });
+```
+
+```console
+$ cargo run -p wyrd-shim --example deadlock -- run.wyrd   # note: no tokio_unstable
+$ cargo run -p wyrd-cli  -- why-blocked run.wyrd           # same report, same CLI
+⛔ DEADLOCK — worker-ab is in a 2-task cycle:
+  worker-ab  --[lock, ...]-->  Mutex@wyrd-shim/examples/deadlock.rs:20  (held by worker-ba)
+  ↳ worker-ba  --[lock, ...]-->  Mutex@wyrd-shim/examples/deadlock.rs:19  (held by worker-ab)
 ```
 
 ## How task attribution works

@@ -31,10 +31,12 @@ mod error;
 mod event;
 mod format;
 mod layer;
+mod recorder;
 mod writer;
 
 pub use error::WeaveError;
 pub use event::{Event, Loc, Record, ResourceId, StateOp, TaskId, TaskKind, FIELD_ACQUIRED_BY};
 pub use format::{file_writer, read_records, FrameReader, FrameWriter, MAGIC, VERSION};
 pub use layer::{WeaveLayer, WeaveLayerBuilder};
+pub use recorder::{Recorder, RecorderBuilder};
 pub use writer::FlushGuard;
