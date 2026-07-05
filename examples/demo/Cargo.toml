@@ -16,3 +16,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+
+[dev-dependencies]
+wyrd-core.workspace = true
+
+# `tokio_unstable` is set via RUSTFLAGS to unlock tokio's tracing spans and the
+# named-task API; declare it so cfg-checking stays quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

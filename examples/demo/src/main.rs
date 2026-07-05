@@ -64,10 +64,24 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
+    // The deadlock scenario leaves tasks parked forever; freeze the recording
+    // with them still parked so `wyrd why-blocked` (default: end-of-recording)
+    // sees the deadlock. Other scenarios complete cleanly, so we shut the
+    // runtime down first to capture their task/resource close events.
+    let freeze_while_blocked = matches!(args.scenario, Scenario::Deadlock);
+
     runtime.block_on(run(args));
 
-    // Shut the runtime down first so task/resource spans close (emitting their
-    // end events), then drop the guard to flush and finalize the recording.
+    if freeze_while_blocked {
+        // Flush the parked state, then exit hard (stuck worker tasks won't join).
+        let dropped = guard.dropped_events();
+        drop(guard);
+        if dropped > 0 {
+            eprintln!("warning: {dropped} events dropped due to queue overflow");
+        }
+        std::process::exit(0);
+    }
+
     drop(runtime);
     let dropped = guard.dropped_events();
     drop(guard);
@@ -172,16 +186,18 @@ async fn deadlock(watchdog_ms: u64) {
         unreachable!("deadlock-ba should never acquire A");
     });
 
-    // Watchdog: give the deadlock time to form, then abort the stuck tasks.
+    // Watchdog: give the deadlock time to fully form, then return. The tasks
+    // stay parked — the caller freezes and finalizes the recording. Keep the
+    // handles alive (do not await; they never resolve) until we return.
     tokio::time::sleep(Duration::from_millis(watchdog_ms)).await;
-    task1.abort();
-    task2.abort();
-    let _ = task1.await;
-    let _ = task2.await;
+    let _ = (&task1, &task2);
+    drop((task1, task2));
 }
 
-/// Spawn a named task via the unstable `task::Builder` API, degrading to a
-/// panic only if the runtime is shutting down (nothing sensible to return).
+/// Spawn a named task via the unstable `task::Builder` API. Without
+/// `--cfg tokio_unstable` the naming API is unavailable, so we degrade to a
+/// plain `tokio::spawn` (wyrd then identifies the task by source location).
+#[cfg(tokio_unstable)]
 fn spawn_named<F>(name: &str, fut: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
@@ -191,4 +207,13 @@ where
         Ok(handle) => handle,
         Err(e) => panic!("failed to spawn task {name}: {e}"),
     }
+}
+
+#[cfg(not(tokio_unstable))]
+fn spawn_named<F>(_name: &str, fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(fut)
 }
