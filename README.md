@@ -17,6 +17,7 @@ naming deadlocks.
 | [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>` and `wyrd stats <recording>`. |
 | [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
+| [`examples/axum`](examples/axum) | an axum server whose handler holds a shared mutex across an `.await`, so requests serialize — self-driving, produces a recording you can inspect. |
 
 ## ⚠️ Instrumented apps require `tokio_unstable`
 
@@ -56,6 +57,51 @@ poll time      : n=48 p50=91.1µs p90=242.1µs p99=706.9ms max=706.9ms
 longest parks  : ...
 channel depths : Semaphore@... peak 2/2
 ```
+
+## Real-world shape: an axum server
+
+[`examples/axum`](examples/axum) is a self-driving reproduction of a classic web
+anti-pattern — a handler that holds a shared mutex across an `.await`:
+
+```console
+$ cargo run -p wyrd-axum-example -- load --record axum.wyrd   # needs tokio_unstable
+$ wyrd why-blocked axum.wyrd
+⏳ ... is blocked; root cause is Sleep@examples/axum/src/main.rs:40 ...:
+  task@axum-0.7.9/src/serve.rs:253  --[poll_acquire, parked 148ms]-->  Mutex@examples/axum/src/main.rs:47  (held by task@axum-0.7.9/src/serve.rs:253)
+  ↳ task@axum-0.7.9/src/serve.rs:253 --[poll_elapsed, parked 148ms]--> Sleep@examples/axum/src/main.rs:40 (no holder)
+```
+
+Read: one request task holds the mutex at `main.rs:47` while sleeping at
+`main.rs:40`; the others are stuck behind it. Request tasks are spawned by axum
+so they share a source location — the *resources* are what pinpoint the bug.
+`load` mode fires concurrent requests and freezes the recording mid-contention;
+`serve --port 3000` runs a real server and flushes on Ctrl-C.
+
+## Using wyrd in your own project
+
+**Install the analyzer** (`wyrd` CLI — pure stable, no `tokio_unstable`):
+
+```console
+$ cargo install --git https://github.com/aoprisan/wyrd wyrd-cli
+$ wyrd --help
+```
+
+**Instrument your app**, either:
+
+- *Deep + universal* — add `wyrd-weave` and build with `tokio_unstable` (see
+  [above](#-instrumented-apps-require-tokio_unstable)); or
+- *Stable + scoped* — add `wyrd-shim` and swap `tokio::spawn` /
+  `tokio::sync::Mutex` / `tokio::sync::mpsc` for `wyrd_shim::*`.
+
+```toml
+[dependencies]
+wyrd-weave = { git = "https://github.com/aoprisan/wyrd" }   # or wyrd-shim
+```
+
+Then: run your app → get a `.wyrd` file → `wyrd why-blocked file.wyrd`. The
+recording format is stable across the two producers, so the same CLI reads
+either. (Not yet published to crates.io; once it is, this becomes
+`cargo install wyrd-cli` and `wyrd-weave = "0.1"`.)
 
 ## Instrumenting your own app
 

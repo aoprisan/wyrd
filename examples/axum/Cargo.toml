@@ -1,0 +1,18 @@
+[package]
+name = "wyrd-axum-example"
+description = "an axum server with a deliberately-contended shared mutex, instrumented with wyrd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wyrd-axum-example"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-weave.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+axum = "0.7"

@@ -101,13 +101,31 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 }
 
-/// Choose a task to explain when none was named: prefer one that is parked at
-/// the query time, falling back to the last-spawned task.
+/// Choose a task to explain when none was named. Prefer a task blocked *behind
+/// another task* (parked on a resource someone else holds) — the interesting
+/// case — then any parked task, then the last-spawned task.
 fn pick_blocked_task(
     rec: &Recording,
     at: Option<u64>,
 ) -> Result<wyrd_core::TaskId, Box<dyn std::error::Error>> {
     let world = rec.world_state(at)?;
+    let holder_of = |resource| {
+        world
+            .resources
+            .iter()
+            .find(|r| r.ident.id == resource)
+            .and_then(|r| r.holder)
+    };
+
+    // 1. Parked on a resource held by a *different* task.
+    for t in &world.tasks {
+        if let TaskStatus::Parked { resource } = t.status {
+            if holder_of(resource).is_some_and(|h| h != t.ident.id) {
+                return Ok(t.ident.id);
+            }
+        }
+    }
+    // 2. Any parked task.
     if let Some(t) = world
         .tasks
         .iter()
@@ -115,6 +133,7 @@ fn pick_blocked_task(
     {
         return Ok(t.ident.id);
     }
+    // 3. Fall back to the last-spawned task.
     world
         .tasks
         .last()
