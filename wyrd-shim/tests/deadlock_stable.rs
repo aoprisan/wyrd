@@ -48,7 +48,12 @@ async fn stable_deadlock_reports_two_cycle() {
         .tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Parked { .. }))
-        .filter(|t| t.ident.name.as_deref().is_some_and(|n| n.starts_with("dead-")))
+        .filter(|t| {
+            t.ident
+                .name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("dead-"))
+        })
         .count();
     assert_eq!(parked, 2, "expected both tasks parked: {:#?}", world.tasks);
 
@@ -78,7 +83,11 @@ async fn stable_deadlock_reports_two_cycle() {
     }
     locs.sort();
     locs.dedup();
-    assert_eq!(locs.len(), 2, "expected two distinct mutex locations: {locs:?}");
+    assert_eq!(
+        locs.len(),
+        2,
+        "expected two distinct mutex locations: {locs:?}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }

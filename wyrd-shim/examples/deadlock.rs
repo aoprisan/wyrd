@@ -11,7 +11,9 @@ use std::time::Duration;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "run.wyrd".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "run.wyrd".to_string());
     let guard = wyrd_shim::init(&path).expect("init recording");
 
     let mutex_a = Arc::new(wyrd_shim::Mutex::new(0u64));

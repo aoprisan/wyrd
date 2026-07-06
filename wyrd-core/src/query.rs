@@ -33,7 +33,11 @@ pub(crate) fn task_ident(conn: &Connection, id: TaskId) -> Result<TaskIdent, Cor
                     id,
                     name,
                     kind: parse_kind(&kind),
-                    loc: Loc { file, line, col: None },
+                    loc: Loc {
+                        file,
+                        line,
+                        col: None,
+                    },
                 })
             },
         )
@@ -46,7 +50,10 @@ pub(crate) fn task_ident(conn: &Connection, id: TaskId) -> Result<TaskIdent, Cor
     }))
 }
 
-pub(crate) fn resource_ident(conn: &Connection, id: ResourceId) -> Result<ResourceIdent, CoreError> {
+pub(crate) fn resource_ident(
+    conn: &Connection,
+    id: ResourceId,
+) -> Result<ResourceIdent, CoreError> {
     let ident = conn
         .query_row(
             "SELECT concrete_type, loc_file, loc_line FROM resources WHERE id = ?1",
@@ -58,7 +65,11 @@ pub(crate) fn resource_ident(conn: &Connection, id: ResourceId) -> Result<Resour
                 Ok(ResourceIdent {
                     id,
                     concrete_type,
-                    loc: Loc { file, line, col: None },
+                    loc: Loc {
+                        file,
+                        line,
+                        col: None,
+                    },
                 })
             },
         )
@@ -144,11 +155,7 @@ fn task_done_at(conn: &Connection, id: TaskId, t: u64) -> Result<bool, CoreError
 
 // --- per-entity folds -------------------------------------------------------
 
-pub(crate) fn task_status(
-    conn: &Connection,
-    id: TaskId,
-    t: u64,
-) -> Result<TaskStatus, CoreError> {
+pub(crate) fn task_status(conn: &Connection, id: TaskId, t: u64) -> Result<TaskStatus, CoreError> {
     if task_done_at(conn, id, t)? {
         return Ok(TaskStatus::Done);
     }
@@ -299,10 +306,11 @@ pub(crate) fn world_state(conn: &Connection, at: u64) -> Result<WorldState, Core
     for id in task_ids {
         let id = id as u64;
         // Only surface tasks that exist by `at`.
-        let spawn: i64 =
-            conn.query_row("SELECT spawn_ts FROM tasks WHERE id = ?1", params![id as i64], |r| {
-                r.get(0)
-            })?;
+        let spawn: i64 = conn.query_row(
+            "SELECT spawn_ts FROM tasks WHERE id = ?1",
+            params![id as i64],
+            |r| r.get(0),
+        )?;
         if (spawn as u64) > at {
             continue;
         }
@@ -480,8 +488,7 @@ pub(crate) fn stats(conn: &Connection, top_n: usize) -> Result<Stats, CoreError>
     // task ends, else until end-of-recording.
     let mut parks: Vec<ParkStat> = Vec::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT task, resource, op_name, ts FROM parks ORDER BY ts")?;
+        let mut stmt = conn.prepare("SELECT task, resource, op_name, ts FROM parks ORDER BY ts")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)? as u64,
@@ -564,10 +571,7 @@ pub(crate) fn stats(conn: &Connection, top_n: usize) -> Result<Stats, CoreError>
 
 /// Fold a resource's permits over all time, returning `(capacity, max_depth)`
 /// where `max_depth = capacity - min(permits)`.
-fn max_channel_depth(
-    conn: &Connection,
-    id: ResourceId,
-) -> Result<Option<(i64, i64)>, CoreError> {
+fn max_channel_depth(conn: &Connection, id: ResourceId) -> Result<Option<(i64, i64)>, CoreError> {
     let mut stmt = conn.prepare(
         "SELECT value, op FROM resource_state
          WHERE resource = ?1 AND field = 'permits' ORDER BY ts, id",

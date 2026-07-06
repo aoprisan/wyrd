@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use wyrd_core::model::TaskStatus;
 use wyrd_core::Recording;
 
 mod render;
@@ -73,7 +72,9 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             let rec = Recording::open(&file)?;
             let task_id = match task {
                 Some(sel) => rec.resolve_task(&sel)?,
-                None => pick_blocked_task(&rec, at)?,
+                None => rec
+                    .pick_blocked_task(at)?
+                    .ok_or("recording contains no tasks")?,
             };
             let report = rec.why_blocked(task_id, at)?;
             if json {
@@ -99,44 +100,4 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
     }
-}
-
-/// Choose a task to explain when none was named. Prefer a task blocked *behind
-/// another task* (parked on a resource someone else holds) — the interesting
-/// case — then any parked task, then the last-spawned task.
-fn pick_blocked_task(
-    rec: &Recording,
-    at: Option<u64>,
-) -> Result<wyrd_core::TaskId, Box<dyn std::error::Error>> {
-    let world = rec.world_state(at)?;
-    let holder_of = |resource| {
-        world
-            .resources
-            .iter()
-            .find(|r| r.ident.id == resource)
-            .and_then(|r| r.holder)
-    };
-
-    // 1. Parked on a resource held by a *different* task.
-    for t in &world.tasks {
-        if let TaskStatus::Parked { resource } = t.status {
-            if holder_of(resource).is_some_and(|h| h != t.ident.id) {
-                return Ok(t.ident.id);
-            }
-        }
-    }
-    // 2. Any parked task.
-    if let Some(t) = world
-        .tasks
-        .iter()
-        .find(|t| matches!(t.status, TaskStatus::Parked { .. }))
-    {
-        return Ok(t.ident.id);
-    }
-    // 3. Fall back to the last-spawned task.
-    world
-        .tasks
-        .last()
-        .map(|t| t.ident.id)
-        .ok_or_else(|| "recording contains no tasks".into())
 }

@@ -1,5 +1,5 @@
-//! Serde-serializable query results shared by the CLI (and, later, an MCP
-//! server and a TUI).
+//! Serde-serializable query results shared by the CLI and the MCP server
+//! (and, later, a TUI).
 
 use serde::{Deserialize, Serialize};
 use wyrd_weave::{Loc, ResourceId, TaskId, TaskKind};

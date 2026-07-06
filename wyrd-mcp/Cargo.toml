@@ -1,0 +1,19 @@
+[package]
+name = "wyrd-mcp"
+description = "MCP server exposing wyrd recording queries (why-blocked, stats, world-state) to AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tokio", "async", "deadlock", "mcp", "debugging"]
+categories = ["development-tools::debugging", "asynchronous"]
+
+[dependencies]
+wyrd-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+wyrd-weave.workspace = true
