@@ -10,8 +10,8 @@
 //! - [`Recording::stats`] — task counts, poll-time percentiles, longest parks,
 //!   channel depths.
 //!
-//! Query results are plain serde-serializable structs (see [`model`]) so a
-//! future MCP server and TUI can share them.
+//! Query results are plain serde-serializable structs (see [`model`]) shared
+//! by the `wyrd` CLI and the `wyrd-mcp` MCP server.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +27,7 @@ use rusqlite::Connection;
 pub use error::CoreError;
 pub use wyrd_weave::{ResourceId, TaskId};
 
-use model::{BlockedReport, Stats, WorldState};
+use model::{BlockedReport, Stats, TaskStatus, WorldState};
 
 /// An ingested recording, backed by an in-memory SQLite database.
 pub struct Recording {
@@ -79,6 +79,40 @@ impl Recording {
     /// Aggregate statistics over the whole recording.
     pub fn stats(&self, top_n: usize) -> Result<Stats, CoreError> {
         query::stats(&self.conn, top_n)
+    }
+
+    /// Choose a task worth explaining when the caller didn't name one. Prefer
+    /// a task blocked *behind another task* (parked on a resource someone else
+    /// holds) — the interesting case — then any parked task, then the
+    /// last-spawned task. `None` only if the recording contains no tasks.
+    pub fn pick_blocked_task(&self, at: Option<u64>) -> Result<Option<TaskId>, CoreError> {
+        let world = self.world_state(at)?;
+        let holder_of = |resource| {
+            world
+                .resources
+                .iter()
+                .find(|r| r.ident.id == resource)
+                .and_then(|r| r.holder)
+        };
+
+        // 1. Parked on a resource held by a *different* task.
+        for t in &world.tasks {
+            if let TaskStatus::Parked { resource } = t.status {
+                if holder_of(resource).is_some_and(|h| h != t.ident.id) {
+                    return Ok(Some(t.ident.id));
+                }
+            }
+        }
+        // 2. Any parked task.
+        if let Some(t) = world
+            .tasks
+            .iter()
+            .find(|t| matches!(t.status, TaskStatus::Parked { .. }))
+        {
+            return Ok(Some(t.ident.id));
+        }
+        // 3. Fall back to the last-spawned task.
+        Ok(world.tasks.last().map(|t| t.ident.id))
     }
 
     fn at_or_end(&self, at: Option<u64>) -> Result<u64, CoreError> {

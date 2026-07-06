@@ -15,6 +15,7 @@ naming deadlocks.
 | [`wyrd-weave`](wyrd-weave) | a `tracing_subscriber::Layer` that normalizes tokio's internal spans/events into a compact causality event stream, written to disk on a dedicated writer thread. |
 | [`wyrd-core`](wyrd-core) | ingests recordings into SQLite; world-state fold + `why_blocked` / `stats` queries returning serde structs. |
 | [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>` and `wyrd stats <recording>`. |
+| [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `stats`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
 | [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
 | [`examples/axum`](examples/axum) | an axum server whose handler holds a shared mutex across an `.await`, so requests serialize — self-driving, produces a recording you can inspect. |
@@ -103,6 +104,26 @@ recording format is stable across the two producers, so the same CLI reads
 either. (Not yet published to crates.io; once it is, this becomes
 `cargo install wyrd-cli` and `wyrd-weave = "0.1"`.)
 
+## Asking an AI agent (MCP + Claude Code)
+
+`wyrd-mcp` serves the same queries over the
+[Model Context Protocol](https://modelcontextprotocol.io) (stdio transport),
+so an agent can inspect recordings itself: `stats` to orient, `why_blocked` to
+walk the park → holder chain (deadlock cycles included), and `world_state` to
+snapshot every task/resource at a timestamp. Results carry both readable text
+and `structuredContent` — the same serde structs the CLI prints with `--json`.
+
+This repo ships a [`.mcp.json`](.mcp.json) that registers the server with
+Claude Code automatically, plus a skill
+([`.claude/skills/wyrd-debug`](.claude/skills/wyrd-debug/SKILL.md)) that
+teaches it the record → inspect → fix workflow — so inside this repo you can
+just ask *"why is my app stuck?"* and point it at a `.wyrd` file. For other
+projects, register the binary yourself:
+
+```console
+$ claude mcp add wyrd -- cargo run --quiet --manifest-path /path/to/wyrd/Cargo.toml -p wyrd-mcp
+```
+
 ## Instrumenting your own app
 
 ```rust
@@ -173,8 +194,8 @@ of two emitted per poll) so holder tracking records the real acquirer.
   `wyrd-weave/src/format.rs`); decode one with
   `cargo run -p wyrd-weave --example dump -- run.wyrd`.
 - wyrd's own diagnostics are gated behind each crate's `diag` feature.
-- Query results are plain serde structs so a future MCP server and TUI can share
-  them.
+- Query results are plain serde structs, shared verbatim by the CLI and the MCP
+  server (and, later, a TUI).
 
 ## Testing
 

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "wyrd": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "-p", "wyrd-mcp"]
+    }
+  }
+}
