@@ -192,12 +192,11 @@ where
                 // The contextual parent span, if it is itself a resource, is the
                 // resource we may collapse into.
                 let parent_resource = ctx.current_span().id().and_then(|pid| {
-                    ctx.span(pid).and_then(|s| {
-                        match s.extensions().get::<SpanTag>().copied() {
+                    ctx.span(pid)
+                        .and_then(|s| match s.extensions().get::<SpanTag>().copied() {
                             Some(SpanTag::Resource { effective }) => Some(effective),
                             _ => None,
-                        }
-                    })
+                        })
                 });
 
                 let self_id = id.into_u64();
@@ -208,7 +207,8 @@ where
                 };
 
                 if let Some(span) = ctx.span(id) {
-                    span.extensions_mut().insert(SpanTag::Resource { effective });
+                    span.extensions_mut()
+                        .insert(SpanTag::Resource { effective });
                 }
 
                 // Only emit a resource for the surviving (non-collapsed) id.
@@ -241,7 +241,8 @@ where
                 if op_name == "poll_acquire" && !COOP_ACQUIRE_SEEN.replace(true) {
                     return;
                 }
-                let (Some(resource), Some(task)) = (nearest_resource(&ctx, event), task_stack_top())
+                let (Some(resource), Some(task)) =
+                    (nearest_resource(&ctx, event), task_stack_top())
                 else {
                     return;
                 };
@@ -562,7 +563,9 @@ impl Visit for StateUpdateVisitor {
         let name = field.name();
         let s = format!("{value:?}");
         if let Some(base) = name.strip_suffix(".op") {
-            self.ops.entry(base.to_owned()).or_insert_with(|| unquote(&s).to_owned());
+            self.ops
+                .entry(base.to_owned())
+                .or_insert_with(|| unquote(&s).to_owned());
             return;
         }
         if name.ends_with(".unit") {

@@ -26,13 +26,7 @@ mod unstable {
         let recording = unique_recording_path();
 
         let status = Command::new(bin)
-            .args([
-                "--scenario",
-                "deadlock",
-                "--watchdog-ms",
-                "500",
-                "--record",
-            ])
+            .args(["--scenario", "deadlock", "--watchdog-ms", "500", "--record"])
             .arg(&recording)
             .status()
             .expect("failed to run wyrd-demo");
@@ -46,7 +40,12 @@ mod unstable {
             .tasks
             .iter()
             .filter(|t| matches!(t.status, TaskStatus::Parked { .. }))
-            .filter(|t| t.ident.name.as_deref().is_some_and(|n| n.starts_with("deadlock")))
+            .filter(|t| {
+                t.ident
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("deadlock"))
+            })
             .collect();
         assert_eq!(
             parked.len(),
@@ -56,7 +55,9 @@ mod unstable {
         );
 
         // why_blocked on one of them must detect the 2-task deadlock cycle.
-        let ab = rec.resolve_task("deadlock-ab").expect("resolve deadlock-ab");
+        let ab = rec
+            .resolve_task("deadlock-ab")
+            .expect("resolve deadlock-ab");
         let report = rec.why_blocked(ab, None).expect("why_blocked");
 
         let cycle = match &report.outcome {

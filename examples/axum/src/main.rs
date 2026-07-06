@@ -144,7 +144,9 @@ async fn run_load(requests: usize, freeze_after_ms: u64) {
 }
 
 async fn run_serve(port: u16) {
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .unwrap();
     println!("serving http://0.0.0.0:{port}/contended (Ctrl-C to flush recording)");
     axum::serve(listener, app())
         .with_graceful_shutdown(async {
