@@ -51,8 +51,8 @@ fn spawn(id: u64, name: &str) -> Event {
 /// A → B / B → A deadlock over two mutexes.
 fn deadlock_recording() -> Recording {
     recording(vec![
-        (1, mutex(100, 10)),  // Mutex A
-        (2, mutex(200, 20)),  // Mutex B
+        (1, mutex(100, 10)), // Mutex A
+        (2, mutex(200, 20)), // Mutex B
         (3, spawn(1, "t1")),
         (4, spawn(2, "t2")),
         // t1 acquires A
@@ -183,7 +183,10 @@ fn resource_root_when_no_holder() {
     let t = rec.resolve_task("waiter").unwrap();
     let report = rec.why_blocked(t, None).unwrap();
     assert!(
-        matches!(report.outcome, BlockedOutcome::ResourceRoot { resource: 500 }),
+        matches!(
+            report.outcome,
+            BlockedOutcome::ResourceRoot { resource: 500 }
+        ),
         "got {:?}",
         report.outcome
     );

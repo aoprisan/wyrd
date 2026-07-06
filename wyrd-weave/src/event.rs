@@ -114,10 +114,7 @@ pub enum Event {
     },
     /// A task woke another (`waker.wake` / `waker.wake_by_ref`). `by` is the
     /// task doing the waking, or `None` for the runtime/timer driver.
-    Wake {
-        woken: TaskId,
-        by: Option<TaskId>,
-    },
+    Wake { woken: TaskId, by: Option<TaskId> },
     /// A resource span was created.
     ResourceNew {
         id: ResourceId,
