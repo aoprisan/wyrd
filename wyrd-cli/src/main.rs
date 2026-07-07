@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use wyrd_core::Recording;
 
 mod render;
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +48,15 @@ enum Command {
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
+    },
+    /// Browse a recording interactively: stats, tasks, resources, and a
+    /// why-blocked view, with a time cursor you can scrub across the recording.
+    Tui {
+        /// The recording file.
+        file: PathBuf,
+        /// How many longest-parks to show on the stats tab.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
     },
 }
 
@@ -97,6 +107,10 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             } else {
                 render::render_stats(&stats);
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Tui { file, top } => {
+            tui::run(&file, top)?;
             Ok(ExitCode::SUCCESS)
         }
     }

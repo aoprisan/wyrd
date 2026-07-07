@@ -20,7 +20,10 @@ channel depths : ...
 ```
 
 `wyrd why-blocked <file> [--task NAME|ID] [--at TS] [--json]` (exit code 2 on a
-detected deadlock) and `wyrd stats <file> [--top N] [--json]`. The CLI itself
+detected deadlock) and `wyrd stats <file> [--top N] [--json]`. For interactive
+exploration, `wyrd tui <file>` opens a terminal UI with Stats / Tasks /
+Resources / Why-blocked tabs and a scrubbable time cursor (`[` `]` to move,
+`g`/`G` for start/end). The CLI itself
 needs no `tokio_unstable`; only the recorded app does (or use `wyrd-shim` for a
 stable recorder). Recordings are produced by
 [`wyrd-weave`](https://crates.io/crates/wyrd-weave) or

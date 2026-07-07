@@ -2,7 +2,7 @@
 
 use wyrd_core::model::{BlockedOutcome, BlockedReport, Stats};
 
-fn ms(ns: u64) -> String {
+pub(crate) fn ms(ns: u64) -> String {
     if ns >= 1_000_000 {
         format!("{:.1}ms", ns as f64 / 1_000_000.0)
     } else if ns >= 1_000 {
