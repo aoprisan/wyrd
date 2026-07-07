@@ -87,8 +87,26 @@ recording. The Tasks, Resources, and Why-blocked views all re-fold to that
 instant, so you can watch state evolve across the run. <kbd>◂</kbd>/<kbd>▸</kbd>
 switch tabs, <kbd>↑</kbd>/<kbd>↓</kbd> move the selection, <kbd>q</kbd> quits.
 
-> Still post-hoc: the TUI reads a `.wyrd` file the app already produced; it does
-> not attach to a live process. Record first, then browse.
+### Live monitoring with `--follow`
+
+Point the TUI at a recording that's still being written and it tails it like
+`tail -f`, re-folding on an interval so you can watch a **running** app:
+
+```console
+$ myapp &                          # writes run.wyrd as it goes (weave layer installed)
+$ wyrd tui --follow run.wyrd       # ● live — updates as new frames land
+```
+
+The header shows <kbd>● live</kbd> while the cursor tracks the growing tail; the
+Why-blocked tab auto-surfaces the most-stuck task, so a deadlock appears the
+moment its cycle forms. Scrub back with <kbd>[</kbd> to freeze and inspect
+(<kbd>⏸ frozen</kbd>); <kbd>G</kbd> snaps back to live.
+
+This is the **zero-added-overhead** design: the recorded program is never
+touched — it keeps appending frames exactly as before, and all the folding and
+rendering cost lives in this separate viewer process. The trade-offs are honest:
+latency is bounded by the recorder's flush cadence, history is whatever the file
+holds, and it reads the file — it does not attach to the process or its memory.
 
 ## Real-world shape: an axum server
 

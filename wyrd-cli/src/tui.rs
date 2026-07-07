@@ -6,10 +6,16 @@
 //! task and see *why it is blocked*, and scrub a time cursor across the
 //! recording to watch task/resource state evolve.
 //!
-//! It is still post-hoc (it reads a file, it does not attach to a live
-//! process); it is a viewer for what the recording already captured.
+//! With `--follow`, it re-reads the file on an interval (like `tail -f`) so you
+//! can watch a *running* app's async state live. This is deliberately the
+//! zero-producer-overhead design: the recorded program is untouched — it just
+//! keeps appending frames to the file as always, and all the folding /
+//! rendering cost lives here, in a separate process. The trade-off is latency
+//! (bounded by the writer's flush cadence) and that history is whatever the
+//! file holds; it does not attach to the process or read its memory.
 
-use std::path::Path;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -23,17 +29,59 @@ use ratatui::{DefaultTerminal, Frame};
 
 use wyrd_core::model::{BlockedOutcome, BlockedReport, Stats, TaskStatus, WorldState};
 use wyrd_core::{Recording, TaskId};
+use wyrd_weave::FrameReader;
 
 use crate::render::ms;
 
+/// How often `--follow` re-folds the growing recording. Doubles as the input
+/// poll timeout, so the UI stays responsive between ticks.
+const REFRESH: Duration = Duration::from_millis(250);
+
 /// Entry point for the `tui` subcommand.
-pub fn run(file: &Path, top: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let rec = Recording::open(file)?;
-    let app = App::new(rec, top)?;
+///
+/// With `follow`, the recording is re-read on an interval (like `tail -f`): the
+/// producer is never touched — this side just re-folds whatever complete frames
+/// are on disk so far.
+pub fn run(file: &Path, top: usize, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (rec, follow_path) = if follow {
+        (load_follow(file), Some(file.to_path_buf()))
+    } else {
+        // One-shot: ingest strictly, so a corrupt file is a hard error.
+        (Recording::open(file)?, None)
+    };
+    let app = App::new(rec, top, follow_path)?;
     let mut terminal = ratatui::init();
     let res = app.run(&mut terminal);
     ratatui::restore();
     res
+}
+
+/// Read a recording that may be mid-write: ingest every *complete* frame and
+/// stop cleanly at a torn tail frame or an as-yet-unflushed header. Missing or
+/// unreadable files fold to an empty recording (follow mode waits for data).
+fn load_follow(path: &Path) -> Recording {
+    match std::fs::read(path) {
+        Ok(bytes) => recording_from_bytes(&bytes),
+        Err(_) => empty_recording(),
+    }
+}
+
+fn recording_from_bytes(bytes: &[u8]) -> Recording {
+    let Ok(mut reader) = FrameReader::new(Cursor::new(bytes)) else {
+        // Header not written (or only partially) yet.
+        return empty_recording();
+    };
+    let mut records = Vec::new();
+    // `next_record` yields `Ok(None)` at a clean boundary and `Err(_)` on a
+    // half-written tail frame; either way we keep the complete prefix.
+    while let Ok(Some(record)) = reader.next_record() {
+        records.push(record);
+    }
+    Recording::from_records(records).unwrap_or_else(|_| empty_recording())
+}
+
+fn empty_recording() -> Recording {
+    Recording::from_records(std::iter::empty()).expect("empty recording is always valid")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,6 +119,18 @@ impl Tab {
 
 struct App {
     rec: Recording,
+    /// When set, re-fold this file on every tick (`--follow`).
+    follow: Option<PathBuf>,
+    /// Time cursor pinned to the growing tail: `at` tracks `end_ts` as it grows.
+    /// Scrubbing unpins it; `G`/End re-pins.
+    live: bool,
+    /// In follow mode, keep the Why-blocked view on the currently most-stuck
+    /// task as the world changes — until the user steers with ↑/↓.
+    auto_select: bool,
+    /// How many longest-parks the Stats tab requests (kept for reloads).
+    top: usize,
+    /// A transient note for the footer, e.g. "waiting for data".
+    status: Option<String>,
     /// Last timestamp of the recording (right edge of the time cursor).
     end_ts: u64,
     /// Current query time; everything but `Stats` is evaluated here.
@@ -86,13 +146,22 @@ struct App {
 }
 
 impl App {
-    fn new(rec: Recording, top: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        rec: Recording,
+        top: usize,
+        follow: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let end_ts = rec.end_ts()?;
         let stats = rec.stats(top)?;
         let world = rec.world_state(Some(end_ts))?;
         let sel_task = rec.pick_blocked_task(Some(end_ts))?;
         let mut app = App {
             rec,
+            follow,
+            live: true,
+            auto_select: true,
+            top,
+            status: None,
             end_ts,
             at: end_ts,
             stats,
@@ -108,7 +177,11 @@ impl App {
     fn run(mut self, terminal: &mut DefaultTerminal) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             terminal.draw(|f| self.draw(f))?;
-            if !event::poll(Duration::from_millis(250))? {
+            // No key within REFRESH → a follow tick (or just loop again).
+            if !event::poll(REFRESH)? {
+                if self.follow.is_some() {
+                    self.reload();
+                }
                 continue;
             }
             if let Event::Key(key) = event::read()? {
@@ -128,13 +201,66 @@ impl App {
                     }
                     KeyCode::Char(']') => self.scrub(self.step()),
                     KeyCode::Char('[') => self.scrub(-self.step()),
-                    KeyCode::Char('G') | KeyCode::End => self.set_at(self.end_ts),
-                    KeyCode::Char('g') | KeyCode::Home => self.set_at(0),
+                    KeyCode::Char('G') | KeyCode::End => {
+                        // Jump to the live tail and resume auto-tracking.
+                        self.live = true;
+                        self.auto_select = true;
+                        self.set_at(self.end_ts);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        self.live = false;
+                        self.set_at(0);
+                    }
                     _ => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// Re-fold the followed recording. Cheap to call: it rebuilds an in-memory
+    /// snapshot from the file's complete frames and re-derives the views. The
+    /// producer is untouched — all of this cost is in the observer.
+    fn reload(&mut self) {
+        let Some(path) = self.follow.clone() else {
+            return;
+        };
+        let rec = load_follow(&path);
+        let Ok(end_ts) = rec.end_ts() else {
+            return; // transient read; keep the last good snapshot
+        };
+        self.rec = rec;
+        self.end_ts = end_ts;
+        if let Ok(stats) = self.rec.stats(self.top) {
+            self.stats = stats;
+        }
+        // Follow the tail when live; otherwise stay put, but never point past
+        // the (possibly shorter) new end.
+        if self.live || self.at > end_ts {
+            self.at = end_ts;
+        }
+        if let Ok(world) = self.rec.world_state(Some(self.at)) {
+            self.world = world;
+        }
+        // In live+auto mode, keep pointing at whatever is most stuck right now;
+        // otherwise only re-pick if the selected task has vanished.
+        let sel_valid = self
+            .sel_task
+            .is_some_and(|id| self.world.tasks.iter().any(|t| t.ident.id == id));
+        if (self.live && self.auto_select) || !sel_valid {
+            self.sel_task = self
+                .rec
+                .pick_blocked_task(Some(self.at))
+                .ok()
+                .flatten()
+                .or_else(|| self.world.tasks.first().map(|t| t.ident.id));
+        }
+        self.refresh_blocked();
+        self.status = self
+            .world
+            .tasks
+            .is_empty()
+            .then(|| "waiting for recording data…".to_string());
     }
 
     /// A time step for the scrubber: ~2% of the recording, at least 1ns.
@@ -143,8 +269,11 @@ impl App {
     }
 
     fn scrub(&mut self, delta: i128) {
-        let next = (self.at as i128 + delta).clamp(0, self.end_ts as i128);
-        self.set_at(next as u64);
+        let next = (self.at as i128 + delta).clamp(0, self.end_ts as i128) as u64;
+        // Scrubbing back unpins the live tail; scrubbing all the way forward
+        // to the end re-pins it.
+        self.live = next == self.end_ts;
+        self.set_at(next);
     }
 
     fn set_at(&mut self, at: u64) {
@@ -176,6 +305,8 @@ impl App {
         if self.tab != Tab::Tasks || self.world.tasks.is_empty() {
             return;
         }
+        // The user is steering: stop auto-tracking the most-stuck task.
+        self.auto_select = false;
         let len = self.world.tasks.len() as isize;
         let cur = self.sel_index().unwrap_or(0) as isize;
         let next = (cur + delta).clamp(0, len - 1) as usize;
@@ -211,13 +342,18 @@ impl App {
     }
 
     fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+        // Title carries the follow indicator: a green ● when tracking the live
+        // tail, a yellow ⏸ when the user has scrubbed away from it.
+        let title: Line = match (self.follow.is_some(), self.live) {
+            (false, _) => " wyrd ".bold().into(),
+            (true, true) => Line::from(vec![" wyrd ".bold(), "● live ".fg(Color::Green).bold()]),
+            (true, false) => {
+                Line::from(vec![" wyrd ".bold(), "⏸ frozen ".fg(Color::Yellow).bold()])
+            }
+        };
         let titles = Tab::ALL.iter().map(|t| t.title());
         let tabs = Tabs::new(titles)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" wyrd ".bold()),
-            )
+            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).bold())
             .select(self.tab.index());
         f.render_widget(tabs, area);
@@ -371,26 +507,39 @@ impl App {
         } else {
             self.at as f64 / self.end_ts as f64
         };
+        let label = if self.follow.is_some() && self.live {
+            format!("t = {} / {}  (now)", ms(self.at), ms(self.end_ts))
+        } else {
+            format!("t = {} / {}", ms(self.at), ms(self.end_ts))
+        };
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio)
-            .label(format!("t = {} / {}", ms(self.at), ms(self.end_ts)));
+            .label(label);
         f.render_widget(gauge, gauge_area);
 
-        let hints = Line::from(vec![
-            key("◂ ▸"),
-            Span::raw(" tabs  "),
-            key("↑ ↓"),
-            Span::raw(" select  "),
-            key("↵"),
-            Span::raw(" why-blocked  "),
-            key("[ ]"),
-            Span::raw(" scrub time  "),
-            key("g/G"),
-            Span::raw(" start/end  "),
-            key("q"),
-            Span::raw(" quit"),
-        ]);
+        // A transient follow note (e.g. "waiting for data") preempts the hints.
+        let hints = match &self.status {
+            Some(note) => Line::from(note.clone().fg(Color::Yellow).italic()),
+            None => Line::from(vec![
+                key("◂ ▸"),
+                Span::raw(" tabs  "),
+                key("↑ ↓"),
+                Span::raw(" select  "),
+                key("↵"),
+                Span::raw(" why-blocked  "),
+                key("[ ]"),
+                Span::raw(" scrub  "),
+                key("g/G"),
+                Span::raw(if self.follow.is_some() {
+                    " start/live  "
+                } else {
+                    " start/end  "
+                }),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+        };
         f.render_widget(Paragraph::new(hints), hint_area);
     }
 }
@@ -540,10 +689,15 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use wyrd_weave::{Event, Loc, Record, StateOp, TaskKind, FIELD_ACQUIRED_BY};
+    use wyrd_weave::{Event, FrameWriter, Loc, Record, StateOp, TaskKind, FIELD_ACQUIRED_BY};
 
     /// The canonical two-mutex deadlock: t1 holds A wants B, t2 holds B wants A.
     fn deadlock_recording() -> Recording {
+        Recording::from_records(deadlock_records()).expect("ingest synthetic recording")
+    }
+
+    /// The same recording as a raw record stream, for the on-disk/follow tests.
+    fn deadlock_records() -> Vec<Record> {
         let loc = |line: u32| Loc {
             file: Some("src/main.rs".into()),
             line: Some(line),
@@ -633,8 +787,21 @@ mod tests {
             ),
             (16, Event::PollEnd { task: 2 }),
         ];
-        Recording::from_records(events.into_iter().map(|(ts, event)| Record { ts, event }))
-            .expect("ingest synthetic recording")
+        events
+            .into_iter()
+            .map(|(ts, event)| Record { ts, event })
+            .collect()
+    }
+
+    /// Serialize records into the on-disk frame format (header + frames).
+    fn to_frames(records: &[Record]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut w = FrameWriter::new(&mut buf).expect("header");
+        for r in records {
+            w.write_record(r).expect("frame");
+        }
+        w.flush().expect("flush");
+        buf
     }
 
     /// Flatten a rendered frame into a single searchable string.
@@ -653,7 +820,7 @@ mod tests {
 
     #[test]
     fn stats_tab_shows_overview() {
-        let app = App::new(deadlock_recording(), 10).unwrap();
+        let app = App::new(deadlock_recording(), 10, None).unwrap();
         let text = render(&app);
         assert!(text.contains("wyrd"), "tab bar present");
         assert!(text.contains("recording span"));
@@ -662,7 +829,7 @@ mod tests {
 
     #[test]
     fn tasks_tab_lists_named_tasks() {
-        let mut app = App::new(deadlock_recording(), 10).unwrap();
+        let mut app = App::new(deadlock_recording(), 10, None).unwrap();
         app.tab = Tab::Tasks;
         let text = render(&app);
         assert!(text.contains("t1"));
@@ -674,7 +841,7 @@ mod tests {
     #[test]
     fn why_blocked_tab_names_the_deadlock() {
         // Default selection lands on a task blocked behind another — the cycle.
-        let mut app = App::new(deadlock_recording(), 10).unwrap();
+        let mut app = App::new(deadlock_recording(), 10, None).unwrap();
         app.tab = Tab::WhyBlocked;
         let text = render(&app);
         assert!(text.contains("DEADLOCK"), "got: {text}");
@@ -683,7 +850,7 @@ mod tests {
 
     #[test]
     fn scrub_clamps_to_recording_bounds() {
-        let mut app = App::new(deadlock_recording(), 10).unwrap();
+        let mut app = App::new(deadlock_recording(), 10, None).unwrap();
         app.set_at(0);
         assert_eq!(app.at, 0);
         app.scrub(-1_000); // cannot go below zero
@@ -697,5 +864,76 @@ mod tests {
     fn tab_navigation_wraps() {
         assert_eq!(Tab::Stats.prev(), Tab::WhyBlocked);
         assert_eq!(Tab::WhyBlocked.next(), Tab::Stats);
+    }
+
+    #[test]
+    fn follow_loader_reads_complete_frames() {
+        let records = deadlock_records();
+        let rec = recording_from_bytes(&to_frames(&records));
+        // Same content as ingesting the records directly.
+        assert_eq!(rec.end_ts().unwrap(), 16);
+        assert_eq!(rec.world_state(None).unwrap().tasks.len(), 2);
+    }
+
+    #[test]
+    fn follow_loader_tolerates_a_torn_tail_frame() {
+        let records = deadlock_records();
+        let mut bytes = to_frames(&records);
+        // Simulate the writer being caught mid-frame: a length prefix claiming
+        // more bytes than actually follow.
+        bytes.extend_from_slice(&999u32.to_le_bytes());
+        bytes.extend_from_slice(b"\x01\x02\x03"); // truncated body
+        let rec = recording_from_bytes(&bytes);
+        // The complete prefix still ingests fully; the torn frame is ignored.
+        assert_eq!(rec.end_ts().unwrap(), 16);
+        assert_eq!(rec.world_state(None).unwrap().tasks.len(), 2);
+    }
+
+    #[test]
+    fn follow_loader_tolerates_an_unflushed_header() {
+        // Only part of the "WYRD" magic has hit disk so far.
+        let rec = recording_from_bytes(b"WY");
+        assert_eq!(rec.end_ts().unwrap(), 0);
+        assert!(rec.world_state(None).unwrap().tasks.is_empty());
+        // A missing file folds to the same empty recording.
+        let missing = load_follow(Path::new("/nonexistent/wyrd/does-not-exist.wyrd"));
+        assert_eq!(missing.end_ts().unwrap(), 0);
+    }
+
+    #[test]
+    fn reload_picks_up_appended_frames_and_tracks_the_tail() {
+        // Write a growing recording to a temp file and drive reload() over it.
+        let path =
+            std::env::temp_dir().join(format!("wyrd-cli-follow-{}.wyrd", std::process::id()));
+        let records = deadlock_records();
+
+        // Start with just the two spawns visible (indices 2..4 in the stream).
+        std::fs::write(&path, to_frames(&records[..4])).unwrap();
+        let mut app = App::new(load_follow(&path), 10, Some(path.clone())).unwrap();
+        assert!(app.live);
+        assert_eq!(app.end_ts, 4);
+        assert_eq!(app.world.tasks.len(), 2);
+        // No deadlock yet — nobody is parked.
+        assert!(!app.blocked.as_ref().unwrap().is_deadlock());
+
+        // The app runs on: the full deadlock is now on disk.
+        std::fs::write(&path, to_frames(&records)).unwrap();
+        app.reload();
+        // Live cursor advanced to the new tail and the deadlock is now visible.
+        assert_eq!(app.end_ts, 16);
+        assert_eq!(app.at, 16);
+        assert!(
+            app.blocked.as_ref().unwrap().is_deadlock(),
+            "reload should surface the freshly-formed deadlock"
+        );
+
+        // Freeze at an earlier instant: reload must not drag the cursor forward.
+        app.live = false;
+        app.set_at(4);
+        std::fs::write(&path, to_frames(&records)).unwrap(); // (unchanged, but re-read)
+        app.reload();
+        assert_eq!(app.at, 4, "a frozen cursor stays put across reloads");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

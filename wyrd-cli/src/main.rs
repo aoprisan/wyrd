@@ -57,6 +57,11 @@ enum Command {
         /// How many longest-parks to show on the stats tab.
         #[arg(long, default_value_t = 10)]
         top: usize,
+        /// Follow the recording as it grows (like `tail -f`): re-fold on an
+        /// interval so you can watch a running app's async state live. The
+        /// recorded program is never touched — all cost is in this viewer.
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -109,8 +114,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Tui { file, top } => {
-            tui::run(&file, top)?;
+        Command::Tui { file, top, follow } => {
+            tui::run(&file, top, follow)?;
             Ok(ExitCode::SUCCESS)
         }
     }
