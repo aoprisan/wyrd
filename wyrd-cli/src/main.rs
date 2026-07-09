@@ -6,8 +6,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use wyrd_core::Recording;
 
+mod follow;
 mod render;
 mod tui;
+mod watch;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +51,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Scan a recording for async anti-patterns: deadlocks, blocking-in-async
+    /// long polls, suspiciously long parks, and saturated channels.
+    /// Exits 2 on errors (deadlocks), 1 on warnings, 0 when clean.
+    Lint {
+        /// The recording file.
+        file: PathBuf,
+        /// Flag any single poll longer than this (blocking-in-async).
+        #[arg(long, default_value_t = 1.0)]
+        long_poll_ms: f64,
+        /// Flag any non-timer park longer than this.
+        #[arg(long, default_value_t = 1000.0)]
+        long_park_ms: f64,
+        /// Timestamp (ns) to evaluate at. Defaults to end-of-recording.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Browse a recording interactively: stats, tasks, resources, and a
     /// why-blocked view, with a time cursor you can scrub across the recording.
     Tui {
@@ -62,6 +83,26 @@ enum Command {
         /// recorded program is never touched — all cost is in this viewer.
         #[arg(long)]
         follow: bool,
+    },
+    /// Watch a growing recording headlessly (for CI and logs): alert with the
+    /// full why-blocked chain when a task is parked beyond a threshold, and
+    /// exit 2 the moment a deadlock forms. Exits 1 at --for if tasks got
+    /// stuck, 0 if all clear.
+    Watch {
+        /// The recording file (may not exist yet; watch waits for data).
+        file: PathBuf,
+        /// Alert when a task has been parked on a non-timer resource this long.
+        #[arg(long, default_value_t = 1000.0)]
+        stuck_ms: f64,
+        /// How often to re-read the recording.
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        /// Stop after this many seconds (exit 0/1). Default: watch forever.
+        #[arg(long, value_name = "SECS")]
+        r#for: Option<f64>,
+        /// Emit newline-delimited JSON alerts instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -114,9 +155,50 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Lint {
+            file,
+            long_poll_ms,
+            long_park_ms,
+            at,
+            json,
+        } => {
+            let rec = Recording::open(&file)?;
+            let config = wyrd_core::model::LintConfig {
+                long_poll_ns: (long_poll_ms * 1e6) as u64,
+                long_park_ns: (long_park_ms * 1e6) as u64,
+            };
+            let report = rec.lint(at, &config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render::render_lint(&report);
+            }
+            Ok(if report.has_errors() {
+                ExitCode::from(2)
+            } else if report.is_clean() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Tui { file, top, follow } => {
             tui::run(&file, top, follow)?;
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Watch {
+            file,
+            stuck_ms,
+            interval_ms,
+            r#for,
+            json,
+        } => {
+            let opts = watch::WatchOpts {
+                stuck_ns: (stuck_ms * 1e6) as u64,
+                interval: std::time::Duration::from_millis(interval_ms),
+                run_for: r#for.map(std::time::Duration::from_secs_f64),
+                json,
+            };
+            Ok(watch::run(&file, opts))
         }
     }
 }

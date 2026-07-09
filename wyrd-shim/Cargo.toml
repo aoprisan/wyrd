@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-shim"
-description = "stable-Rust tokio wrappers (spawn/Mutex/mpsc) that record wyrd causality events without tokio_unstable"
+description = "stable-Rust tokio wrappers (spawn, Mutex, RwLock, Semaphore, Notify, mpsc, oneshot) that record wyrd causality events without tokio_unstable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

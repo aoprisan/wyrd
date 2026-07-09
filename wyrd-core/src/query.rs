@@ -306,10 +306,10 @@ pub(crate) fn world_state(conn: &Connection, at: u64) -> Result<WorldState, Core
     for id in task_ids {
         let id = id as u64;
         // Only surface tasks that exist by `at`.
-        let spawn: i64 = conn.query_row(
-            "SELECT spawn_ts FROM tasks WHERE id = ?1",
+        let (spawn, parent): (i64, Option<i64>) = conn.query_row(
+            "SELECT spawn_ts, parent FROM tasks WHERE id = ?1",
             params![id as i64],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if (spawn as u64) > at {
             continue;
@@ -317,6 +317,7 @@ pub(crate) fn world_state(conn: &Connection, at: u64) -> Result<WorldState, Core
         tasks.push(TaskState {
             ident: task_ident(conn, id)?,
             status: task_status(conn, id, at)?,
+            parent: parent.map(|p| p as u64),
         });
     }
 
@@ -486,78 +487,11 @@ pub(crate) fn stats(conn: &Connection, top_n: usize) -> Result<Stats, CoreError>
 
     // Longest parks: each park lasts until the task's next poll, else until the
     // task ends, else until end-of-recording.
-    let mut parks: Vec<ParkStat> = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT task, resource, op_name, ts FROM parks ORDER BY ts")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)? as u64,
-                r.get::<_, i64>(1)? as u64,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)? as u64,
-            ))
-        })?;
-        for row in rows {
-            let (task, resource, op_name, ts) = row?;
-            let next_poll: Option<i64> = conn
-                .query_row(
-                    "SELECT MIN(start_ts) FROM polls WHERE task = ?1 AND start_ts > ?2",
-                    params![task as i64, ts as i64],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
-            let end = match next_poll {
-                Some(n) => n as u64,
-                None => {
-                    let te: Option<Option<i64>> = conn
-                        .query_row(
-                            "SELECT end_ts FROM tasks WHERE id = ?1",
-                            params![task as i64],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    match te {
-                        Some(Some(e)) => e as u64,
-                        _ => hi,
-                    }
-                }
-            };
-            parks.push(ParkStat {
-                task: task_ident(conn, task)?,
-                resource: resource_ident(conn, resource)?,
-                op_name,
-                since_ts: ts,
-                dur_ns: end.saturating_sub(ts),
-            });
-        }
-    }
+    let mut parks = park_episodes(conn, hi)?;
     parks.sort_by(|a, b| b.dur_ns.cmp(&a.dur_ns));
     parks.truncate(top_n);
 
-    // Channel depths: bounded resources (capacity > 1), max depth over time.
-    let mut channel_depths: Vec<ChannelDepth> = Vec::new();
-    {
-        let mut res_ids: Vec<i64> = Vec::new();
-        let mut stmt = conn.prepare("SELECT id FROM resources ORDER BY new_ts, id")?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-        for row in rows {
-            res_ids.push(row?);
-        }
-        for id in res_ids {
-            let id = id as u64;
-            if let Some((capacity, max_depth)) = max_channel_depth(conn, id)? {
-                if capacity > 1 {
-                    channel_depths.push(ChannelDepth {
-                        resource: resource_ident(conn, id)?,
-                        capacity,
-                        max_depth,
-                    });
-                }
-            }
-        }
-    }
-    channel_depths.sort_by(|a, b| b.max_depth.cmp(&a.max_depth));
+    let channel_depths = channel_depths(conn)?;
 
     Ok(Stats {
         duration_ns,
@@ -567,6 +501,85 @@ pub(crate) fn stats(conn: &Connection, top_n: usize) -> Result<Stats, CoreError>
         longest_parks: parks,
         channel_depths,
     })
+}
+
+/// Every park episode starting at or before `hi`, unsorted. Each park lasts
+/// until the task's next poll, else until the task ends, else until `hi`;
+/// episodes still open at `hi` are clipped there.
+pub(crate) fn park_episodes(conn: &Connection, hi: u64) -> Result<Vec<ParkStat>, CoreError> {
+    let mut parks: Vec<ParkStat> = Vec::new();
+    let mut stmt =
+        conn.prepare("SELECT task, resource, op_name, ts FROM parks WHERE ts <= ?1 ORDER BY ts")?;
+    let rows = stmt.query_map(params![hi as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, i64>(1)? as u64,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)? as u64,
+        ))
+    })?;
+    for row in rows {
+        let (task, resource, op_name, ts) = row?;
+        let next_poll: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(start_ts) FROM polls WHERE task = ?1 AND start_ts > ?2",
+                params![task as i64, ts as i64],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let end = match next_poll {
+            Some(n) => n as u64,
+            None => {
+                let te: Option<Option<i64>> = conn
+                    .query_row(
+                        "SELECT end_ts FROM tasks WHERE id = ?1",
+                        params![task as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match te {
+                    Some(Some(e)) => e as u64,
+                    _ => hi,
+                }
+            }
+        };
+        parks.push(ParkStat {
+            task: task_ident(conn, task)?,
+            resource: resource_ident(conn, resource)?,
+            op_name,
+            since_ts: ts,
+            dur_ns: end.min(hi).saturating_sub(ts),
+        });
+    }
+    Ok(parks)
+}
+
+/// Max observed depth of every bounded resource (capacity > 1), deepest first.
+pub(crate) fn channel_depths(conn: &Connection) -> Result<Vec<ChannelDepth>, CoreError> {
+    let mut channel_depths: Vec<ChannelDepth> = Vec::new();
+    let mut res_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id FROM resources ORDER BY new_ts, id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            res_ids.push(row?);
+        }
+    }
+    for id in res_ids {
+        let id = id as u64;
+        if let Some((capacity, max_depth)) = max_channel_depth(conn, id)? {
+            if capacity > 1 {
+                channel_depths.push(ChannelDepth {
+                    resource: resource_ident(conn, id)?,
+                    capacity,
+                    max_depth,
+                });
+            }
+        }
+    }
+    channel_depths.sort_by(|a, b| b.max_depth.cmp(&a.max_depth));
+    Ok(channel_depths)
 }
 
 /// Fold a resource's permits over all time, returning `(capacity, max_depth)`

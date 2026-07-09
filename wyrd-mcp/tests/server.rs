@@ -112,7 +112,7 @@ fn initialize_handshake() {
 }
 
 #[test]
-fn lists_the_three_tools() {
+fn lists_the_tools() {
     let result = request(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let names: Vec<&str> = result["tools"]
         .as_array()
@@ -120,7 +120,7 @@ fn lists_the_three_tools() {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names, ["why_blocked", "stats", "world_state"]);
+    assert_eq!(names, ["why_blocked", "stats", "lint", "world_state"]);
     for tool in result["tools"].as_array().unwrap() {
         assert_eq!(tool["inputSchema"]["required"], json!(["recording"]));
     }
@@ -161,6 +161,30 @@ fn stats_counts_tasks_and_resources() {
     let stats = &result["structuredContent"];
     assert_eq!(stats["task_count"], 2);
     assert_eq!(stats["resource_count"], 2);
+}
+
+#[test]
+fn lint_reports_the_deadlock_as_an_error() {
+    let path = deadlock_recording_file("lint");
+    let result = call_tool("lint", json!({ "recording": &path }));
+    assert_eq!(result["isError"], false);
+    let report = &result["structuredContent"];
+    let findings = report["findings"].as_array().expect("findings array");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["kind"] == "deadlock" && f["severity"] == "error"),
+        "expected a deadlock error: {report}"
+    );
+
+    // Threshold overrides are honoured (echoed back in the config).
+    let tuned = call_tool(
+        "lint",
+        json!({ "recording": &path, "long_poll_ms": 2.5, "long_park_ms": 50 }),
+    );
+    let config = &tuned["structuredContent"]["config"];
+    assert_eq!(config["long_poll_ns"], 2_500_000);
+    assert_eq!(config["long_park_ns"], 50_000_000);
 }
 
 #[test]

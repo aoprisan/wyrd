@@ -14,7 +14,6 @@
 //! (bounded by the writer's flush cadence) and that history is whatever the
 //! file holds; it does not attach to the process or read its memory.
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,10 +26,10 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 
-use wyrd_core::model::{BlockedOutcome, BlockedReport, Stats, TaskStatus, WorldState};
+use wyrd_core::model::{BlockedOutcome, BlockedReport, Stats, TaskState, TaskStatus, WorldState};
 use wyrd_core::{Recording, TaskId};
-use wyrd_weave::FrameReader;
 
+use crate::follow::load_follow;
 use crate::render::ms;
 
 /// How often `--follow` re-folds the growing recording. Doubles as the input
@@ -56,49 +55,29 @@ pub fn run(file: &Path, top: usize, follow: bool) -> Result<(), Box<dyn std::err
     res
 }
 
-/// Read a recording that may be mid-write: ingest every *complete* frame and
-/// stop cleanly at a torn tail frame or an as-yet-unflushed header. Missing or
-/// unreadable files fold to an empty recording (follow mode waits for data).
-fn load_follow(path: &Path) -> Recording {
-    match std::fs::read(path) {
-        Ok(bytes) => recording_from_bytes(&bytes),
-        Err(_) => empty_recording(),
-    }
-}
-
-fn recording_from_bytes(bytes: &[u8]) -> Recording {
-    let Ok(mut reader) = FrameReader::new(Cursor::new(bytes)) else {
-        // Header not written (or only partially) yet.
-        return empty_recording();
-    };
-    let mut records = Vec::new();
-    // `next_record` yields `Ok(None)` at a clean boundary and `Err(_)` on a
-    // half-written tail frame; either way we keep the complete prefix.
-    while let Ok(Some(record)) = reader.next_record() {
-        records.push(record);
-    }
-    Recording::from_records(records).unwrap_or_else(|_| empty_recording())
-}
-
-fn empty_recording() -> Recording {
-    Recording::from_records(std::iter::empty()).expect("empty recording is always valid")
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Stats,
     Tasks,
+    Tree,
     Resources,
     WhyBlocked,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Stats, Tab::Tasks, Tab::Resources, Tab::WhyBlocked];
+    const ALL: [Tab; 5] = [
+        Tab::Stats,
+        Tab::Tasks,
+        Tab::Tree,
+        Tab::Resources,
+        Tab::WhyBlocked,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Tab::Stats => "Stats",
             Tab::Tasks => "Tasks",
+            Tab::Tree => "Tree",
             Tab::Resources => "Resources",
             Tab::WhyBlocked => "Why-blocked",
         }
@@ -335,6 +314,7 @@ impl App {
         match self.tab {
             Tab::Stats => self.draw_stats(f, body),
             Tab::Tasks => self.draw_tasks(f, body),
+            Tab::Tree => self.draw_tree(f, body),
             Tab::Resources => self.draw_resources(f, body),
             Tab::WhyBlocked => self.draw_blocked(f, body),
         }
@@ -440,6 +420,14 @@ impl App {
         let mut state = TableState::default();
         state.select(self.sel_index());
         f.render_stateful_widget(table, area, &mut state);
+    }
+
+    fn draw_tree(&self, f: &mut Frame, area: Rect) {
+        let lines = tree_lines(&self.world);
+        let p = Paragraph::new(lines)
+            .block(titled(format!(" spawn tree @ t={} ", ms(self.at))))
+            .wrap(Wrap { trim: false });
+        f.render_widget(p, area);
     }
 
     fn draw_resources(&self, f: &mut Frame, area: Rect) {
@@ -595,6 +583,81 @@ fn status_cell(status: &TaskStatus, world: &WorldState) -> (String, Style) {
     }
 }
 
+/// Render the spawn tree at the cursor time: parents indent their children
+/// (box-drawing branches), each task with its coloured status. Tasks whose
+/// parent is unknown or absent from the snapshot are roots, in spawn order.
+fn tree_lines(world: &WorldState) -> Vec<Line<'static>> {
+    use std::collections::{HashMap, HashSet};
+
+    if world.tasks.is_empty() {
+        return vec![Line::from("no tasks at this time".italic())];
+    }
+    let present: HashSet<TaskId> = world.tasks.iter().map(|t| t.ident.id).collect();
+    let mut children: HashMap<TaskId, Vec<&TaskState>> = HashMap::new();
+    let mut roots: Vec<&TaskState> = Vec::new();
+    // world.tasks is spawn-ordered, so sibling order is spawn order.
+    for t in &world.tasks {
+        match t.parent.filter(|p| present.contains(p) && *p != t.ident.id) {
+            Some(p) => children.entry(p).or_default().push(t),
+            None => roots.push(t),
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut visited: HashSet<TaskId> = HashSet::new();
+    for root in roots {
+        push_tree(root, "", "", &children, world, &mut visited, &mut lines);
+    }
+    lines
+}
+
+fn push_tree(
+    t: &TaskState,
+    lead: &str,
+    branch: &str,
+    children: &std::collections::HashMap<TaskId, Vec<&TaskState>>,
+    world: &WorldState,
+    visited: &mut std::collections::HashSet<TaskId>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    if !visited.insert(t.ident.id) {
+        return; // defensive: a malformed recording could claim a parent cycle
+    }
+    let (status, style) = status_cell(&t.status, world);
+    lines.push(Line::from(vec![
+        Span::raw(format!("{lead}{branch}")),
+        Span::styled(t.ident.label(), Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(status, style),
+    ]));
+    let kids: &[&TaskState] = children.get(&t.ident.id).map_or(&[], Vec::as_slice);
+    for (i, kid) in kids.iter().enumerate() {
+        // Roots carry no branch glyph, so their children need no continuation
+        // rail either; below a "├─" the rail continues, below a "└─" it stops.
+        let child_lead = if branch.is_empty() {
+            lead.to_string()
+        } else if branch.starts_with('└') {
+            format!("{lead}   ")
+        } else {
+            format!("{lead}│  ")
+        };
+        let child_branch = if i + 1 == kids.len() {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        push_tree(
+            kid,
+            &child_lead,
+            child_branch,
+            children,
+            world,
+            visited,
+            lines,
+        );
+    }
+}
+
 /// Build the styled why-blocked view: a headline, the park → holder chain, and
 /// (for a deadlock) the cycle summary. Mirrors `render::render_blocked`.
 fn blocked_lines(report: &BlockedReport, world: &WorldState) -> Vec<Line<'static>> {
@@ -687,6 +750,7 @@ fn blocked_lines(report: &BlockedReport, world: &WorldState) -> Vec<Line<'static
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::follow::recording_from_bytes;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use wyrd_weave::{Event, FrameWriter, Loc, Record, StateOp, TaskKind, FIELD_ACQUIRED_BY};
@@ -846,6 +910,33 @@ mod tests {
         let text = render(&app);
         assert!(text.contains("DEADLOCK"), "got: {text}");
         assert!(text.contains("cycle"));
+    }
+
+    #[test]
+    fn tree_tab_indents_children_under_parents() {
+        let mut records = deadlock_records();
+        records.push(Record {
+            ts: 17,
+            event: Event::TaskSpawn {
+                id: 3,
+                parent: Some(1),
+                name: Some("child-of-t1".into()),
+                loc: Loc {
+                    file: Some("src/main.rs".into()),
+                    line: Some(2),
+                    col: None,
+                },
+                kind: TaskKind::Task,
+            },
+        });
+        let rec = Recording::from_records(records).expect("ingest");
+        let mut app = App::new(rec, 10, None).unwrap();
+        app.tab = Tab::Tree;
+        let text = render(&app);
+        assert!(text.contains("spawn tree"), "got: {text}");
+        // The child hangs off t1 with a branch glyph; the roots carry none.
+        assert!(text.contains("└─ child-of-t1"), "got: {text}");
+        assert!(text.contains("t1") && text.contains("t2"));
     }
 
     #[test]

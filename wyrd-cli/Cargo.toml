@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-cli"
-description = "the `wyrd` CLI: why-blocked and stats over recordings"
+description = "the `wyrd` CLI: why-blocked, stats, lint, watch, and an interactive TUI over recordings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

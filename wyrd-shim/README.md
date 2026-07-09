@@ -6,9 +6,10 @@ Stable-Rust tokio wrappers that record the same
 
 Where `wyrd-weave` reads tokio's unstable internals and sees *everything*, this
 shim instruments a few wrapper types from the outside. The trade-off: it only
-sees tasks/resources routed through `wyrd_shim::{spawn, Mutex, mpsc}` (not
-primitives inside dependencies), but it works on stable, gives exact
-`file:line:col` source locations, and tracks holders from observed state.
+sees tasks/resources routed through `wyrd_shim::{spawn, Mutex, RwLock,
+Semaphore, Notify, mpsc, oneshot}` (not primitives inside dependencies), but it
+works on stable, gives exact `file:line:col` source locations, and tracks
+holders from observed state.
 
 ```rust
 let _guard = wyrd_shim::init("run.wyrd")?;              // no RUSTFLAGS needed
