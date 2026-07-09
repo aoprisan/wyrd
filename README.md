@@ -5,8 +5,10 @@ tokio's own instrumentation knows about your tasks and resources, then lets you
 ask *why is this task stuck?* — walking the park → resource → holder chain and
 naming deadlocks.
 
-> Phases 1 + 2: the instrumentation layer, event recording, and a one-shot
-> `wyrd why-blocked` / `wyrd stats` CLI. No TUI yet.
+> Phases 1 + 2: the instrumentation layer, event recording, one-shot
+> `wyrd why-blocked` / `wyrd stats` commands, and an interactive
+> `wyrd tui` for browsing a recording (stats, tasks, resources, why-blocked)
+> with a scrubbable time cursor.
 
 ## Workspace
 
@@ -14,7 +16,7 @@ naming deadlocks.
 |-------|------------|
 | [`wyrd-weave`](wyrd-weave) | a `tracing_subscriber::Layer` that normalizes tokio's internal spans/events into a compact causality event stream, written to disk on a dedicated writer thread. |
 | [`wyrd-core`](wyrd-core) | ingests recordings into SQLite; world-state fold + `why_blocked` / `stats` queries returning serde structs. |
-| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>` and `wyrd stats <recording>`. |
+| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>`, `wyrd stats <recording>`, and `wyrd tui <recording>` (interactive [ratatui](https://ratatui.rs) viewer). |
 | [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `stats`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
 | [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
@@ -58,6 +60,53 @@ poll time      : n=48 p50=91.1µs p90=242.1µs p99=706.9ms max=706.9ms
 longest parks  : ...
 channel depths : Semaphore@... peak 2/2
 ```
+
+## Browsing a recording interactively (`wyrd tui`)
+
+For anything larger than a toy, the one-shot commands get tedious — you want to
+scan the task list, pick one, and see *why it's stuck* without re-running.
+`wyrd tui` opens a recording in a terminal UI:
+
+```console
+$ cargo run -p wyrd-cli -- tui run.wyrd
+```
+
+- **Stats** — the same overview `wyrd stats` prints (span, poll-time
+  percentiles, longest parks, channel depths).
+- **Tasks** — every task at the cursor time and its status (running / idle /
+  `parked on <resource>` / done). Select one and press <kbd>Enter</kbd> to jump
+  to…
+- **Resources** — each resource with its presumed holder, lock state, and
+  channel depth.
+- **Why-blocked** — the selected task's park → resource → holder chain, with
+  deadlock cycles named and highlighted (the `wyrd why-blocked` view, live).
+
+A **time cursor** runs along the bottom: <kbd>[</kbd> / <kbd>]</kbd> scrub
+backward/forward, <kbd>g</kbd> / <kbd>G</kbd> jump to the start/end of the
+recording. The Tasks, Resources, and Why-blocked views all re-fold to that
+instant, so you can watch state evolve across the run. <kbd>◂</kbd>/<kbd>▸</kbd>
+switch tabs, <kbd>↑</kbd>/<kbd>↓</kbd> move the selection, <kbd>q</kbd> quits.
+
+### Live monitoring with `--follow`
+
+Point the TUI at a recording that's still being written and it tails it like
+`tail -f`, re-folding on an interval so you can watch a **running** app:
+
+```console
+$ myapp &                          # writes run.wyrd as it goes (weave layer installed)
+$ wyrd tui --follow run.wyrd       # ● live — updates as new frames land
+```
+
+The header shows <kbd>● live</kbd> while the cursor tracks the growing tail; the
+Why-blocked tab auto-surfaces the most-stuck task, so a deadlock appears the
+moment its cycle forms. Scrub back with <kbd>[</kbd> to freeze and inspect
+(<kbd>⏸ frozen</kbd>); <kbd>G</kbd> snaps back to live.
+
+This is the **zero-added-overhead** design: the recorded program is never
+touched — it keeps appending frames exactly as before, and all the folding and
+rendering cost lives in this separate viewer process. The trade-offs are honest:
+latency is bounded by the recorder's flush cadence, history is whatever the file
+holds, and it reads the file — it does not attach to the process or its memory.
 
 ## Real-world shape: an axum server
 
@@ -194,8 +243,8 @@ of two emitted per poll) so holder tracking records the real acquirer.
   `wyrd-weave/src/format.rs`); decode one with
   `cargo run -p wyrd-weave --example dump -- run.wyrd`.
 - wyrd's own diagnostics are gated behind each crate's `diag` feature.
-- Query results are plain serde structs, shared verbatim by the CLI and the MCP
-  server (and, later, a TUI).
+- Query results are plain serde structs, shared verbatim by the CLI, the MCP
+  server, and the `wyrd tui` viewer.
 
 ## Testing
 
