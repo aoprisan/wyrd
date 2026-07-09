@@ -55,27 +55,33 @@ If a recording is empty or reports nothing, the usual cause is a missing
 ## 2. Inspecting a recording
 
 The repo's `.mcp.json` registers the `wyrd` MCP server (`cargo run -p
-wyrd-mcp`), which exposes three tools. All take a `recording` path; timestamps
+wyrd-mcp`), which exposes four tools. All take a `recording` path; timestamps
 are ns since recording start.
 
 | tool | use it to |
 |------|-----------|
-| `stats` | orient first: duration, task count, poll percentiles, longest parks, peak channel depths |
+| `lint` | triage first: deadlocks (errors), blocking-in-async long polls, long non-timer parks, saturated channels — with tunable `long_poll_ms` / `long_park_ms` |
+| `stats` | orient: duration, task count, poll percentiles, longest parks, peak channel depths |
 | `why_blocked` | explain one task's blockage; omit `task` to auto-pick the most interesting parked task, or pass a task name / span id from `world_state` |
 | `world_state` | list every task (running/idle/parked/done) and resource (holder, locked, permits, depth), optionally at a timestamp `at` |
 
-Start with `stats`; long parks there tell you which tasks to feed to
-`why_blocked`. Use `world_state` with `at` to replay how the situation
-developed over time.
+Start with `lint` — its findings usually *are* the answer. Otherwise `stats`;
+long parks there tell you which tasks to feed to `why_blocked`. Use
+`world_state` with `at` to replay how the situation developed over time.
 
 CLI fallback (same queries, `--json` for structured output):
 
 ```console
+$ cargo run -p wyrd-cli -- lint run.wyrd [--long-poll-ms MS] [--long-park-ms MS] [--json]
 $ cargo run -p wyrd-cli -- why-blocked run.wyrd [--task NAME|ID] [--at NS] [--json]
 $ cargo run -p wyrd-cli -- stats run.wyrd [--top N] [--json]
 ```
 
-`why-blocked` exits 2 when it detects a deadlock — useful in scripts/tests.
+`why-blocked` exits 2 when it detects a deadlock; `lint` exits 2 on errors
+(deadlocks) and 1 on warnings — useful in scripts/tests. To monitor a *running*
+app instead of a finished recording, `wyrd watch run.wyrd [--stuck-ms MS]
+[--for SECS] [--json]` tails the growing file and alerts (full why-blocked
+chain) when a task gets stuck, exiting 2 the moment a deadlock forms.
 
 ## 3. Reading a `why_blocked` report
 

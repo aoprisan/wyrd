@@ -76,6 +76,9 @@ pub struct TaskState {
     pub ident: TaskIdent,
     #[serde(flatten)]
     pub status: TaskStatus,
+    /// The task that spawned this one, if recorded — the spawn-tree edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<TaskId>,
 }
 
 /// A resource and its folded state at an instant.
@@ -146,6 +149,100 @@ impl BlockedReport {
     /// Whether the report describes a deadlock.
     pub fn is_deadlock(&self) -> bool {
         matches!(self.outcome, BlockedOutcome::Deadlock { .. })
+    }
+}
+
+/// Thresholds for [`lint`](crate::Recording::lint) findings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LintConfig {
+    /// A single poll longer than this is flagged as blocking-in-async.
+    pub long_poll_ns: u64,
+    /// A park (on a non-timer resource) longer than this is flagged.
+    pub long_park_ns: u64,
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            long_poll_ns: 1_000_000,     // 1ms: a poll should never block
+            long_park_ns: 1_000_000_000, // 1s: parked this long looks stuck
+        }
+    }
+}
+
+/// Severity of a lint finding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum LintSeverity {
+    Error,
+    Warning,
+}
+
+/// What a lint finding is about.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LintKind {
+    /// Tasks in a hold-and-wait cycle.
+    Deadlock {
+        cycle: Vec<TaskIdent>,
+        resources: Vec<ResourceIdent>,
+    },
+    /// A task whose polls exceed the threshold: blocking (or heavy compute)
+    /// inside async code, starving the executor.
+    LongPoll {
+        task: TaskIdent,
+        /// How many polls exceeded the threshold.
+        count: u64,
+        /// The worst offending poll.
+        max_ns: u64,
+        threshold_ns: u64,
+    },
+    /// A task parked on a (non-timer) resource beyond the threshold.
+    LongPark {
+        task: TaskIdent,
+        resource: ResourceIdent,
+        op_name: String,
+        /// How many park episodes exceeded the threshold.
+        count: u64,
+        /// The longest episode.
+        max_ns: u64,
+        threshold_ns: u64,
+    },
+    /// A bounded channel/semaphore that hit its capacity: backpressure.
+    SaturatedChannel {
+        resource: ResourceIdent,
+        capacity: i64,
+        max_depth: i64,
+    },
+}
+
+/// One lint finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LintFinding {
+    pub severity: LintSeverity,
+    #[serde(flatten)]
+    pub kind: LintKind,
+}
+
+/// Result of a `lint` query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LintReport {
+    pub at: u64,
+    pub config: LintConfig,
+    pub findings: Vec<LintFinding>,
+}
+
+impl LintReport {
+    /// Whether any finding is an error (a deadlock).
+    pub fn has_errors(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| f.severity == LintSeverity::Error)
+    }
+
+    /// Whether the recording is clean.
+    pub fn is_clean(&self) -> bool {
+        self.findings.is_empty()
     }
 }
 

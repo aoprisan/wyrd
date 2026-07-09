@@ -10,7 +10,8 @@
 //! - **+** works on stable Rust, no `tokio_unstable`, and gives cleaner holder
 //!   tracking and real source locations (via `#[track_caller]`).
 //! - **−** only sees tasks spawned with [`spawn`] and resources built from this
-//!   crate's [`Mutex`]/[`mpsc`] — not primitives used inside dependencies.
+//!   crate's wrappers ([`Mutex`], [`RwLock`], [`Semaphore`], [`Notify`],
+//!   [`mpsc`], [`oneshot`]) — not primitives used inside dependencies.
 //!
 //! Because it emits the identical [`wyrd_weave::Event`] vocabulary, recordings
 //! are consumed by the unchanged `wyrd-core` / `wyrd` CLI.
@@ -40,8 +41,15 @@ use pin_project_lite::pin_project;
 use wyrd_weave::{Event, FlushGuard, Loc, Recorder, TaskId, TaskKind};
 
 pub mod mpsc;
+mod notify;
+pub mod oneshot;
+mod rwlock;
+mod semaphore;
 mod sync;
 
+pub use notify::{Notified, Notify};
+pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use semaphore::{AcquireError, Semaphore, SemaphorePermit};
 pub use sync::{Mutex, MutexGuard};
 
 /// Error returned by [`init`].

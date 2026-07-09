@@ -5,10 +5,11 @@ tokio's own instrumentation knows about your tasks and resources, then lets you
 ask *why is this task stuck?* — walking the park → resource → holder chain and
 naming deadlocks.
 
-> Phases 1 + 2: the instrumentation layer, event recording, one-shot
-> `wyrd why-blocked` / `wyrd stats` commands, and an interactive
-> `wyrd tui` for browsing a recording (stats, tasks, resources, why-blocked)
-> with a scrubbable time cursor.
+> Phases 1–3: the instrumentation layer, event recording, one-shot
+> `wyrd why-blocked` / `wyrd stats` / `wyrd lint` commands, an interactive
+> `wyrd tui` for browsing a recording (stats, tasks, spawn tree, resources,
+> why-blocked) with a scrubbable time cursor, and a headless `wyrd watch`
+> for CI-style live monitoring.
 
 ## Workspace
 
@@ -61,6 +62,55 @@ longest parks  : ...
 channel depths : Semaphore@... peak 2/2
 ```
 
+## Linting a recording (`wyrd lint`)
+
+`wyrd lint` distills the same folds into triaged findings — the "is anything
+wrong with this app?" command, built for CI gates:
+
+```console
+$ wyrd lint run.wyrd
+⛔ error: deadlock — 2-task cycle: deadlock-ab → deadlock-ba → (back to start)
+    • Mutex@examples/demo/src/main.rs:171
+    • Mutex@examples/demo/src/main.rs:170
+⚠ warning: long poll — hasher spent up to 18.2ms inside a single poll (3 polls
+   over the 1.0ms threshold); blocking or heavy compute in async code
+⚠ warning: saturated channel — mpsc::channel@src/main.rs:88 peaked at 2/2; …
+
+3 findings (1 error, 2 warnings)
+```
+
+It flags **deadlocks** (errors), **blocking-in-async** (any single poll over
+`--long-poll-ms`, default 1ms — including a task still stuck *inside* a poll;
+`spawn_blocking` tasks are exempt, they block by design),
+**long parks** on non-timer resources (`--long-park-ms`, default 1000ms;
+`Sleep`/`Interval` waits are intentional and never flagged), and **saturated
+channels** (a bounded channel/semaphore that hit capacity). Exit codes gate
+scripts: `2` on any error, `1` on warnings only, `0` when clean. `--json`
+emits the full structured report.
+
+## Watching a live app headlessly (`wyrd watch`)
+
+`wyrd tui --follow` is for humans; `wyrd watch` is the same live tailing for
+CI jobs, logs, and terminals without a TTY. It re-folds the growing recording
+on an interval and prints a full why-blocked chain the moment a task has been
+parked (on a non-timer resource) beyond a threshold — and exits `2` the moment
+a deadlock forms:
+
+```console
+$ myapp &                                    # keeps appending to run.wyrd
+$ wyrd watch run.wyrd --stuck-ms 500 --for 30
+--- DEADLOCK ---
+⛔ DEADLOCK — worker-ab is in a 2-task cycle:
+  ...
+$ echo $?
+2
+```
+
+Each stuck-task episode alerts once (no spam while it stays stuck); `--for
+SECS` bounds the watch for CI (exit `1` if anything got stuck, `0` if all
+clear), and `--json` emits newline-delimited JSON alerts for log pipelines.
+Like follow mode, the recorded program is never touched.
+
 ## Browsing a recording interactively (`wyrd tui`)
 
 For anything larger than a toy, the one-shot commands get tedious — you want to
@@ -76,6 +126,8 @@ $ cargo run -p wyrd-cli -- tui run.wyrd
 - **Tasks** — every task at the cursor time and its status (running / idle /
   `parked on <resource>` / done). Select one and press <kbd>Enter</kbd> to jump
   to…
+- **Tree** — the task spawn tree at the cursor time: who spawned whom, each
+  task with its live status, so a stuck subtree is visible at a glance.
 - **Resources** — each resource with its presumed holder, lock state, and
   channel depth.
 - **Why-blocked** — the selected task's park → resource → holder chain, with
@@ -83,7 +135,7 @@ $ cargo run -p wyrd-cli -- tui run.wyrd
 
 A **time cursor** runs along the bottom: <kbd>[</kbd> / <kbd>]</kbd> scrub
 backward/forward, <kbd>g</kbd> / <kbd>G</kbd> jump to the start/end of the
-recording. The Tasks, Resources, and Why-blocked views all re-fold to that
+recording. The Tasks, Tree, Resources, and Why-blocked views all re-fold to that
 instant, so you can watch state evolve across the run. <kbd>◂</kbd>/<kbd>▸</kbd>
 switch tabs, <kbd>↑</kbd>/<kbd>↓</kbd> move the selection, <kbd>q</kbd> quits.
 
@@ -157,9 +209,10 @@ either. (Not yet published to crates.io; once it is, this becomes
 
 `wyrd-mcp` serves the same queries over the
 [Model Context Protocol](https://modelcontextprotocol.io) (stdio transport),
-so an agent can inspect recordings itself: `stats` to orient, `why_blocked` to
-walk the park → holder chain (deadlock cycles included), and `world_state` to
-snapshot every task/resource at a timestamp. Results carry both readable text
+so an agent can inspect recordings itself: `lint` for triaged findings,
+`stats` to orient, `why_blocked` to walk the park → holder chain (deadlock
+cycles included), and `world_state` to snapshot every task/resource at a
+timestamp. Results carry both readable text
 and `structuredContent` — the same serde structs the CLI prints with `--json`.
 
 This repo ships a [`.mcp.json`](.mcp.json) that registers the server with
@@ -205,13 +258,14 @@ wyrd-shim   (stable wrapper types)  ─────────┘
 | | `wyrd-weave` (unstable layer) | `wyrd-shim` (stable wrappers) |
 |---|---|---|
 | Requires `tokio_unstable` | **yes** | **no** |
-| Coverage | every task/resource, incl. inside dependencies, zero code changes | only what you route through `wyrd_shim::{spawn, Mutex, mpsc}` |
+| Coverage | every task/resource, incl. inside dependencies, zero code changes | only what you route through `wyrd_shim::{spawn, Mutex, RwLock, Semaphore, Notify, mpsc, oneshot}` |
 | Source locations | from tokio (sometimes missing, e.g. mpsc) | exact `file:line:col` via `#[track_caller]` |
 | Holder signal | inferred from `poll_acquire` readiness | observed directly (try-lock → acquire → guard drop) |
 
 Use the shim when you can't (or won't) enable `tokio_unstable` and are willing
-to swap `tokio::spawn`/`tokio::sync::Mutex`/`tokio::sync::mpsc` for the wyrd
-wrappers; use the layer when you need to see into code you don't control.
+to swap the `tokio::sync` primitives (`Mutex`, `RwLock`, `Semaphore`, `Notify`,
+`mpsc`, `oneshot`) and `tokio::spawn` for the wyrd wrappers; use the layer when
+you need to see into code you don't control.
 
 ```rust
 let _guard = wyrd_shim::init("run.wyrd").unwrap();       // stable, no RUSTFLAGS

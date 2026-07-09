@@ -1,6 +1,6 @@
 //! Human-readable rendering of query results.
 
-use wyrd_core::model::{BlockedOutcome, BlockedReport, Stats};
+use wyrd_core::model::{BlockedOutcome, BlockedReport, LintKind, LintReport, LintSeverity, Stats};
 
 pub(crate) fn ms(ns: u64) -> String {
     if ns >= 1_000_000 {
@@ -72,6 +72,93 @@ pub fn render_blocked(report: &BlockedReport) {
             );
         }
     }
+}
+
+pub fn render_lint(report: &LintReport) {
+    if report.is_clean() {
+        println!("✓ no findings at t={}.", ms(report.at));
+        return;
+    }
+
+    for f in &report.findings {
+        let tag = match f.severity {
+            LintSeverity::Error => "⛔ error",
+            LintSeverity::Warning => "⚠ warning",
+        };
+        match &f.kind {
+            LintKind::Deadlock { cycle, resources } => {
+                let names: Vec<String> = cycle.iter().map(|t| t.label()).collect();
+                println!(
+                    "{tag}: deadlock — {}-task cycle: {} → (back to start)",
+                    cycle.len(),
+                    names.join(" → "),
+                );
+                for r in resources {
+                    println!("    • {}", r.label());
+                }
+            }
+            LintKind::LongPoll {
+                task,
+                count,
+                max_ns,
+                threshold_ns,
+            } => {
+                println!(
+                    "{tag}: long poll — {} spent up to {} inside a single poll \
+                     ({count} poll{} over the {} threshold); blocking or heavy \
+                     compute in async code",
+                    task.label(),
+                    ms(*max_ns),
+                    if *count == 1 { "" } else { "s" },
+                    ms(*threshold_ns),
+                );
+            }
+            LintKind::LongPark {
+                task,
+                resource,
+                op_name,
+                count,
+                max_ns,
+                threshold_ns,
+            } => {
+                println!(
+                    "{tag}: long park — {} parked up to {} on {} [{op_name}] \
+                     ({count} park{} over the {} threshold)",
+                    task.label(),
+                    ms(*max_ns),
+                    resource.label(),
+                    if *count == 1 { "" } else { "s" },
+                    ms(*threshold_ns),
+                );
+            }
+            LintKind::SaturatedChannel {
+                resource,
+                capacity,
+                max_depth,
+            } => {
+                println!(
+                    "{tag}: saturated channel — {} peaked at {max_depth}/{capacity}; \
+                     senders were (or will be) parked on backpressure",
+                    resource.label(),
+                );
+            }
+        }
+    }
+
+    let errors = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == LintSeverity::Error)
+        .count();
+    let warnings = report.findings.len() - errors;
+    println!();
+    println!(
+        "{} finding{} ({errors} error{}, {warnings} warning{})",
+        report.findings.len(),
+        if report.findings.len() == 1 { "" } else { "s" },
+        if errors == 1 { "" } else { "s" },
+        if warnings == 1 { "" } else { "s" },
+    );
 }
 
 pub fn render_stats(stats: &Stats) {

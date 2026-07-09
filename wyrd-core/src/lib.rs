@@ -9,6 +9,8 @@
 //!   detecting deadlock cycles.
 //! - [`Recording::stats`] — task counts, poll-time percentiles, longest parks,
 //!   channel depths.
+//! - [`Recording::lint`] — distill the above into findings: deadlocks,
+//!   blocking-in-async long polls, long parks, saturated channels.
 //!
 //! Query results are plain serde-serializable structs (see [`model`]) shared
 //! by the `wyrd` CLI and the `wyrd-mcp` MCP server.
@@ -17,6 +19,7 @@
 
 mod error;
 mod ingest;
+mod lint;
 pub mod model;
 mod query;
 
@@ -27,7 +30,7 @@ use rusqlite::Connection;
 pub use error::CoreError;
 pub use wyrd_weave::{ResourceId, TaskId};
 
-use model::{BlockedReport, Stats, TaskStatus, WorldState};
+use model::{BlockedReport, LintConfig, LintReport, Stats, TaskStatus, WorldState};
 
 /// An ingested recording, backed by an in-memory SQLite database.
 pub struct Recording {
@@ -79,6 +82,14 @@ impl Recording {
     /// Aggregate statistics over the whole recording.
     pub fn stats(&self, top_n: usize) -> Result<Stats, CoreError> {
         query::stats(&self.conn, top_n)
+    }
+
+    /// Scan the recording (up to `at`, default: end) for async anti-patterns:
+    /// deadlocks, blocking-in-async long polls, suspiciously long parks, and
+    /// saturated channels. See [`model::LintConfig`] for the thresholds.
+    pub fn lint(&self, at: Option<u64>, config: &LintConfig) -> Result<LintReport, CoreError> {
+        let at = self.at_or_end(at)?;
+        lint::lint(&self.conn, at, config)
     }
 
     /// Choose a task worth explaining when the caller didn't name one. Prefer

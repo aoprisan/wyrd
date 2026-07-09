@@ -83,12 +83,13 @@ fn initialize_result(params: &Value) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": "Inspect .wyrd recordings of tokio applications. \
-            Start with `stats` for an overview, then `why_blocked` to walk a \
-            stuck task's park → resource → holder chain (it names deadlock \
-            cycles). `world_state` lists every task and resource at an \
-            instant; its task names are valid `task` selectors for \
-            `why_blocked`. All timestamps are nanoseconds since the start of \
-            the recording.",
+            Start with `lint` for a triaged list of findings (deadlocks, \
+            blocking-in-async, long parks, saturated channels) or `stats` for \
+            an overview, then `why_blocked` to walk a stuck task's park → \
+            resource → holder chain (it names deadlock cycles). `world_state` \
+            lists every task and resource at an instant; its task names are \
+            valid `task` selectors for `why_blocked`. All timestamps are \
+            nanoseconds since the start of the recording.",
     })
 }
 
@@ -134,6 +135,30 @@ fn tool_definitions() -> Value {
                     "top": {
                         "type": "integer",
                         "description": "How many longest-parks to include (default 10)",
+                    },
+                },
+                "required": ["recording"],
+            },
+        },
+        {
+            "name": "lint",
+            "description": "Scan a recording for async anti-patterns and \
+                return triaged findings: deadlocks (errors), \
+                blocking-in-async long polls, suspiciously long non-timer \
+                parks, and saturated channels (warnings). The best first \
+                call when asked \"is anything wrong with this app?\".",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recording": recording,
+                    "at": at,
+                    "long_poll_ms": {
+                        "type": "number",
+                        "description": "Flag any single poll longer than this, in ms (default 1)",
+                    },
+                    "long_park_ms": {
+                        "type": "number",
+                        "description": "Flag any non-timer park longer than this, in ms (default 1000)",
                     },
                 },
                 "required": ["recording"],
@@ -203,6 +228,21 @@ fn run_tool(name: &str, args: &Value) -> Result<Value, String> {
         "stats" => {
             let top = args.get("top").and_then(Value::as_u64).unwrap_or(10) as usize;
             serde_json::to_value(rec.stats(top).map_err(|e| e.to_string())?)
+        }
+        "lint" => {
+            let defaults = wyrd_core::model::LintConfig::default();
+            let ms_to_ns = |v: &Value| v.as_f64().map(|ms| (ms * 1e6) as u64);
+            let config = wyrd_core::model::LintConfig {
+                long_poll_ns: args
+                    .get("long_poll_ms")
+                    .and_then(ms_to_ns)
+                    .unwrap_or(defaults.long_poll_ns),
+                long_park_ns: args
+                    .get("long_park_ms")
+                    .and_then(ms_to_ns)
+                    .unwrap_or(defaults.long_park_ns),
+            };
+            serde_json::to_value(rec.lint(at, &config).map_err(|e| e.to_string())?)
         }
         "world_state" => serde_json::to_value(rec.world_state(at).map_err(|e| e.to_string())?),
         other => return Err(format!("unknown tool: {other}")),
