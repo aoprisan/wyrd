@@ -17,8 +17,10 @@
 
 #![forbid(unsafe_code)]
 
+mod diff;
 mod error;
 mod ingest;
+mod latency;
 mod lint;
 pub mod model;
 mod query;
@@ -27,10 +29,11 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+pub use diff::diff;
 pub use error::CoreError;
 pub use wyrd_weave::{ResourceId, TaskId};
 
-use model::{BlockedReport, LintConfig, LintReport, Stats, TaskStatus, WorldState};
+use model::{BlockedReport, LatencyReport, LintConfig, LintReport, Stats, TaskStatus, WorldState};
 
 /// An ingested recording, backed by an in-memory SQLite database.
 pub struct Recording {
@@ -90,6 +93,32 @@ impl Recording {
     pub fn lint(&self, at: Option<u64>, config: &LintConfig) -> Result<LintReport, CoreError> {
         let at = self.at_or_end(at)?;
         lint::lint(&self.conn, at, config)
+    }
+
+    /// Attribute where a task's lifetime went: own poll time, resource waits
+    /// (blamed on holders), timer waits, scheduler lag (woken → polled), and
+    /// idle. `at` clips the window for still-running tasks (default: end);
+    /// `top_n` bounds the reported wait episodes.
+    pub fn why_slow(
+        &self,
+        task: TaskId,
+        at: Option<u64>,
+        top_n: usize,
+    ) -> Result<LatencyReport, CoreError> {
+        let at = self.at_or_end(at)?;
+        latency::why_slow(&self.conn, task, at, top_n)
+    }
+
+    /// Choose a task worth latency-explaining when the caller didn't name
+    /// one: the task with the most total parked time, else the longest-lived.
+    pub fn pick_slow_task(&self, at: Option<u64>) -> Result<Option<TaskId>, CoreError> {
+        let at = self.at_or_end(at)?;
+        latency::pick_slow_task(&self.conn, at)
+    }
+
+    /// The underlying connection, for sibling modules ([`diff`]).
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Choose a task worth explaining when the caller didn't name one. Prefer

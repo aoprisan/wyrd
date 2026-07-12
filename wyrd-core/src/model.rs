@@ -246,6 +246,260 @@ impl LintReport {
     }
 }
 
+// --- why-slow: causal latency attribution -----------------------------------
+
+/// What a holder task was doing while another task waited on its resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HolderActivity {
+    pub task: TaskIdent,
+    /// Time the holder spent being polled during the wait window.
+    pub polling_ns: u64,
+    /// Time the holder spent parked during the wait window.
+    pub parked_ns: u64,
+    /// The resource the holder was (dominantly) parked on, if any — the next
+    /// hop of the latency chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_on: Option<ResourceIdent>,
+}
+
+/// One wait episode in a task's lifetime: a park, split at the wake into
+/// resource-wait and scheduler-lag portions, with the blame attached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitEpisode {
+    pub resource: ResourceIdent,
+    pub op_name: String,
+    /// When the task parked.
+    pub since_ts: u64,
+    /// Park → wake (or → next poll if no wake was recorded).
+    pub wait_ns: u64,
+    /// Wake → next poll: the task was runnable but the executor hadn't
+    /// polled it yet.
+    pub sched_lag_ns: u64,
+    /// Whether the resource is a timer (`Sleep`/`Interval`/`Timeout`) — an
+    /// intentional wait.
+    pub is_timer: bool,
+    /// Who held the resource during the wait, and what they were doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<HolderActivity>,
+}
+
+/// Result of a `why_slow` query: a task's lifetime decomposed into where the
+/// time actually went, with the dominant waits blamed on their holders.
+///
+/// The buckets partition `total_ns`:
+/// `own_poll_ns + resource_wait_ns + timer_wait_ns + sched_lag_ns + idle_ns
+///  == total_ns`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatencyReport {
+    pub task: TaskIdent,
+    /// Window start: the task's spawn (or the recording start if it clips).
+    pub from_ts: u64,
+    /// Window end: the task's end, or the query time if still alive.
+    pub to_ts: u64,
+    pub total_ns: u64,
+    /// Time spent inside `poll` — the task's own compute.
+    pub own_poll_ns: u64,
+    pub poll_count: u64,
+    /// Time parked on non-timer resources (locks, channels, semaphores).
+    pub resource_wait_ns: u64,
+    /// Time parked on timers (`Sleep`/`Interval`/`Timeout`) — intentional.
+    pub timer_wait_ns: u64,
+    /// Time between being woken and actually being polled: executor lag.
+    pub sched_lag_ns: u64,
+    /// Alive but neither polled, parked, nor known-runnable (e.g. waiting on
+    /// something wyrd can't see, or yielded).
+    pub idle_ns: u64,
+    /// The longest waits, longest first (both resource and timer waits).
+    pub waits: Vec<WaitEpisode>,
+}
+
+// --- diff: run-over-run regression detection ---------------------------------
+
+/// Thresholds for [`diff`](crate::diff) findings: a metric regresses when it
+/// grows by more than `ratio` **and** by more than `abs_floor_ns`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffConfig {
+    /// Relative growth needed to flag (1.5 = +50%).
+    pub ratio: f64,
+    /// Absolute growth (ns) needed to flag — silences noise on tiny values.
+    pub abs_floor_ns: u64,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self {
+            ratio: 1.5,
+            abs_floor_ns: 1_000_000, // 1ms
+        }
+    }
+}
+
+/// One run's headline numbers, for the diff banner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSummary {
+    pub duration_ns: u64,
+    pub task_count: u64,
+    pub resource_count: u64,
+    /// Total time spent inside polls, across all tasks.
+    pub total_poll_ns: u64,
+    /// Total time spent parked on non-timer resources, across all tasks.
+    pub total_wait_ns: u64,
+    /// Distinct deadlock cycles detected.
+    pub deadlocks: u64,
+}
+
+/// Aggregate behavior of one task group (tasks sharing a stable identity:
+/// their name, else `kind@file:line`) within one run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGroupStats {
+    /// How many task instances the group had.
+    pub instances: u64,
+    pub total_poll_ns: u64,
+    pub max_poll_ns: u64,
+    /// Total time parked on non-timer resources.
+    pub total_wait_ns: u64,
+    pub max_wait_ns: u64,
+}
+
+impl TaskGroupStats {
+    /// Mean poll time per instance — the regression-checked metric.
+    pub fn mean_poll_ns(&self) -> u64 {
+        self.total_poll_ns / self.instances.max(1)
+    }
+    /// Mean non-timer wait per instance — the regression-checked metric.
+    pub fn mean_wait_ns(&self) -> u64 {
+        self.total_wait_ns / self.instances.max(1)
+    }
+}
+
+/// A task group across the two runs. `None` on a side means the group did not
+/// exist in that run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGroupDiff {
+    /// The stable identity: task name, else `kind@file:line`.
+    pub key: String,
+    pub baseline: Option<TaskGroupStats>,
+    pub current: Option<TaskGroupStats>,
+}
+
+/// Aggregate behavior of one resource group (resources sharing
+/// `Type@file:line`) within one run. Timer resources are excluded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceGroupStats {
+    pub instances: u64,
+    /// Total time tasks spent parked on this group's resources.
+    pub total_wait_ns: u64,
+    /// Distinct tasks that parked on it.
+    pub waiters: u64,
+    /// Largest capacity seen, for bounded resources.
+    pub capacity: Option<i64>,
+    /// Deepest observed depth, for bounded resources.
+    pub max_depth: Option<i64>,
+}
+
+/// A resource group across the two runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceGroupDiff {
+    /// The stable identity: `Type@file:line`, else the type alone.
+    pub key: String,
+    pub baseline: Option<ResourceGroupStats>,
+    pub current: Option<ResourceGroupStats>,
+}
+
+/// How serious a diff finding is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffSeverity {
+    /// The current run has a defect the baseline didn't (a new deadlock).
+    Error,
+    /// A behavioral regression beyond the thresholds.
+    Warning,
+    /// An improvement or notable change.
+    Info,
+}
+
+/// What changed between the runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffKind {
+    /// The current run deadlocks and the baseline didn't (for this cycle).
+    NewDeadlock { cycle: Vec<String> },
+    /// A baseline deadlock is gone.
+    FixedDeadlock { cycle: Vec<String> },
+    /// A task group's mean poll time grew past the thresholds.
+    PollRegression {
+        key: String,
+        baseline_ns: u64,
+        current_ns: u64,
+    },
+    /// A task group's mean non-timer wait grew past the thresholds.
+    WaitRegression {
+        key: String,
+        baseline_ns: u64,
+        current_ns: u64,
+    },
+    /// A resource group newly hit its capacity.
+    NewSaturation {
+        key: String,
+        capacity: i64,
+        max_depth: i64,
+    },
+    /// A task group's mean poll time shrank past the thresholds.
+    PollImprovement {
+        key: String,
+        baseline_ns: u64,
+        current_ns: u64,
+    },
+    /// A task group's mean non-timer wait shrank past the thresholds.
+    WaitImprovement {
+        key: String,
+        baseline_ns: u64,
+        current_ns: u64,
+    },
+    /// A task group only present in the current run (with meaningful time).
+    NewTaskGroup { key: String },
+    /// A task group only present in the baseline (with meaningful time).
+    RemovedTaskGroup { key: String },
+}
+
+/// One diff finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffFinding {
+    pub severity: DiffSeverity,
+    #[serde(flatten)]
+    pub kind: DiffKind,
+}
+
+/// Result of diffing two recordings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffReport {
+    pub config: DiffConfig,
+    pub baseline: RunSummary,
+    pub current: RunSummary,
+    /// All task groups from either run, biggest behavioral change first.
+    pub task_groups: Vec<TaskGroupDiff>,
+    /// All non-timer resource groups from either run, biggest change first.
+    pub resource_groups: Vec<ResourceGroupDiff>,
+    /// Verdicts: errors first, then warnings, then info.
+    pub findings: Vec<DiffFinding>,
+}
+
+impl DiffReport {
+    /// Whether any finding is an error (a new deadlock).
+    pub fn has_errors(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| f.severity == DiffSeverity::Error)
+    }
+
+    /// Whether any finding is a regression warning.
+    pub fn has_regressions(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| f.severity == DiffSeverity::Warning)
+    }
+}
+
 /// A parked interval, for the "longest parks" report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParkStat {

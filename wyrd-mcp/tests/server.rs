@@ -120,10 +120,93 @@ fn lists_the_tools() {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
-    assert_eq!(names, ["why_blocked", "stats", "lint", "world_state"]);
+    assert_eq!(
+        names,
+        [
+            "why_blocked",
+            "why_slow",
+            "diff",
+            "stats",
+            "lint",
+            "world_state"
+        ]
+    );
     for tool in result["tools"].as_array().unwrap() {
-        assert_eq!(tool["inputSchema"]["required"], json!(["recording"]));
+        let required = if tool["name"] == "diff" {
+            json!(["baseline", "current"])
+        } else {
+            json!(["recording"])
+        };
+        assert_eq!(tool["inputSchema"]["required"], required);
     }
+}
+
+#[test]
+fn why_slow_attributes_the_wait() {
+    let path = deadlock_recording_file("why-slow");
+    // t1 parked at ts 12 and never polled again: its wait dominates. With no
+    // `task` named the server picks the most-parked task.
+    let result = call_tool("why_slow", json!({ "recording": &path }));
+    assert_eq!(result["isError"], false, "got: {result}");
+
+    let report = &result["structuredContent"];
+    assert!(report["resource_wait_ns"].as_u64().unwrap() > 0);
+    let waits = report["waits"].as_array().expect("wait episodes");
+    assert!(!waits.is_empty());
+    // The wait is blamed on the mutex's holder.
+    assert!(waits[0]["holder"]["task"]["name"].is_string());
+}
+
+#[test]
+fn diff_flags_a_new_deadlock() {
+    let deadlocked = deadlock_recording_file("diff-current");
+
+    // A clean baseline: one task, one quick poll.
+    let clean = std::env::temp_dir().join(format!(
+        "wyrd-mcp-test-{}-diff-baseline.wyrd",
+        std::process::id()
+    ));
+    let mut writer = file_writer(&clean).expect("open recording for writing");
+    let events = vec![
+        (
+            1,
+            Event::TaskSpawn {
+                id: 1,
+                parent: None,
+                name: Some("t1".into()),
+                loc: Loc {
+                    file: Some("src/main.rs".into()),
+                    line: Some(1),
+                    col: None,
+                },
+                kind: TaskKind::Task,
+            },
+        ),
+        (2, Event::PollStart { task: 1 }),
+        (3, Event::PollEnd { task: 1 }),
+        (4, Event::TaskEnd { id: 1 }),
+    ];
+    for (ts, event) in events {
+        writer
+            .write_record(&Record { ts, event })
+            .expect("write record");
+    }
+    writer.flush().expect("flush recording");
+
+    let result = call_tool(
+        "diff",
+        json!({ "baseline": &clean, "current": &deadlocked }),
+    );
+    assert_eq!(result["isError"], false, "got: {result}");
+
+    let report = &result["structuredContent"];
+    let findings = report["findings"].as_array().expect("findings");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["kind"] == "new_deadlock" && f["severity"] == "error"),
+        "got: {findings:#?}"
+    );
 }
 
 #[test]

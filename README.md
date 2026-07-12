@@ -3,13 +3,16 @@
 **Async causality inspection for tokio applications.** wyrd records what
 tokio's own instrumentation knows about your tasks and resources, then lets you
 ask *why is this task stuck?* — walking the park → resource → holder chain and
-naming deadlocks.
+naming deadlocks — *where did this task's time go?* (`wyrd why-slow`: latency
+attribution that blames each wait on its holder), and *did my change make
+async behavior worse?* (`wyrd diff`: regression verdicts between two runs).
 
-> Phases 1–3: the instrumentation layer, event recording, one-shot
+> Phases 1–4: the instrumentation layer, event recording, one-shot
 > `wyrd why-blocked` / `wyrd stats` / `wyrd lint` commands, an interactive
 > `wyrd tui` for browsing a recording (stats, tasks, spawn tree, resources,
-> why-blocked) with a scrubbable time cursor, and a headless `wyrd watch`
-> for CI-style live monitoring.
+> why-blocked) with a scrubbable time cursor, a headless `wyrd watch`
+> for CI-style live monitoring, causal latency attribution (`wyrd why-slow`),
+> and run-over-run regression diffing (`wyrd diff`).
 
 ## Workspace
 
@@ -17,8 +20,8 @@ naming deadlocks.
 |-------|------------|
 | [`wyrd-weave`](wyrd-weave) | a `tracing_subscriber::Layer` that normalizes tokio's internal spans/events into a compact causality event stream, written to disk on a dedicated writer thread. |
 | [`wyrd-core`](wyrd-core) | ingests recordings into SQLite; world-state fold + `why_blocked` / `stats` queries returning serde structs. |
-| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `wyrd why-blocked <recording>`, `wyrd stats <recording>`, and `wyrd tui <recording>` (interactive [ratatui](https://ratatui.rs) viewer). |
-| [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `stats`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
+| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `why-blocked`, `why-slow`, `diff`, `stats`, `lint`, `watch`, and `wyrd tui <recording>` (interactive [ratatui](https://ratatui.rs) viewer). |
+| [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `why_slow`, `diff`, `stats`, `lint`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
 | [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
 | [`examples/axum`](examples/axum) | an axum server whose handler holds a shared mutex across an `.await`, so requests serialize — self-driving, produces a recording you can inspect. |
@@ -61,6 +64,63 @@ poll time      : n=48 p50=91.1µs p90=242.1µs p99=706.9ms max=706.9ms
 longest parks  : ...
 channel depths : Semaphore@... peak 2/2
 ```
+
+## Explaining latency (`wyrd why-slow`)
+
+`why-blocked` answers *why is this task stuck?*; `why-slow` answers *where did
+this task's time actually go?* It decomposes a task's lifetime into its own
+poll time (compute), waits on resources — each **blamed on the holder**, with
+what the holder was doing during your wait — intentional timer waits,
+scheduler lag (woken but not yet polled), and idle:
+
+```console
+$ wyrd why-slow run.wyrd --task mutex-waiter
+task mutex-waiter: 31.2ms from spawn (+911.4µs) to end
+
+  own polls         511.6µs    1.6%  (4 polls)
+  resource wait      24.3ms   77.9%
+  timer wait          6.2ms   19.7%
+  scheduler lag     133.2µs    0.4%  (woken → polled)
+  idle/other        106.5µs    0.3%
+
+top waits:
+  1.     24.3ms  Mutex@examples/demo/src/main.rs:131 [poll_acquire] at +7.6ms
+       └ +73.9µs scheduler lag after the wake
+       └ held by mutex-holder: itself parked 24.2ms on Sleep@examples/demo/src/main.rs:135 — the chain continues there
+```
+
+That last line is the classic bug caught red-handed: the holder kept the lock
+across a `sleep().await`. When a wait's holder is itself parked, the report
+names the next resource — run `why-slow` on the holder to follow the chain.
+The five buckets partition the lifetime exactly, so nothing hides. Omit
+`--task` to auto-pick the most-parked task; `--json` for the structured
+report. Scheduler-lag attribution comes from tokio's waker events: the gap
+between a task's wake and its next poll is executor delay, not the resource's
+fault.
+
+## Catching regressions between runs (`wyrd diff`)
+
+`wyrd diff` compares two recordings — a known-good baseline and the run to
+judge — and reports *behavioral* regressions. Span ids mean nothing across
+processes, so tasks are aligned by stable identity (their name, else
+`kind@file:line`) and resources by `Type@file:line`, then compared
+per-instance (2× the tasks doing 2× the work is not a regression):
+
+```console
+$ wyrd diff baseline.wyrd current.wyrd
+baseline: 32.5ms span, 5 tasks, 64.3ms poll, 48.8ms wait
+current : 602.1ms span, 5 tasks, 1205.5ms poll, 2236.3ms wait, 1 deadlock(s)
+⛔ error: NEW DEADLOCK — cycle: deadlock-ab → deadlock-ba → (back to start); not present in baseline
+⚠ regression: hasher mean poll time 1.2ms → 19.8ms (×16.5)
+✓ note: deadlock fixed — baseline cycle a → b is gone
+```
+
+A metric regresses when it grows by more than `--ratio` (default ×1.5) **and**
+more than `--floor-ms` (default 1ms — silences noise on tiny values). Exit
+codes gate CI: `2` on a new deadlock, `1` on regressions (poll/wait growth,
+newly saturated channels), `0` when clean or improved. Record a baseline on
+`main`, record on the PR, `wyrd diff` the pair — async behavior is now a
+reviewable, gateable artifact.
 
 ## Linting a recording (`wyrd lint`)
 
@@ -211,7 +271,9 @@ either. (Not yet published to crates.io; once it is, this becomes
 [Model Context Protocol](https://modelcontextprotocol.io) (stdio transport),
 so an agent can inspect recordings itself: `lint` for triaged findings,
 `stats` to orient, `why_blocked` to walk the park → holder chain (deadlock
-cycles included), and `world_state` to snapshot every task/resource at a
+cycles included), `why_slow` to attribute a task's latency (and follow the
+blame chain holder by holder), `diff` to judge a run against a baseline, and
+`world_state` to snapshot every task/resource at a
 timestamp. Results carry both readable text
 and `structuredContent` — the same serde structs the CLI prints with `--json`.
 

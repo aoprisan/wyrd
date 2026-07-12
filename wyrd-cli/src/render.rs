@@ -1,6 +1,9 @@
 //! Human-readable rendering of query results.
 
-use wyrd_core::model::{BlockedOutcome, BlockedReport, LintKind, LintReport, LintSeverity, Stats};
+use wyrd_core::model::{
+    BlockedOutcome, BlockedReport, DiffKind, DiffReport, DiffSeverity, LatencyReport, LintKind,
+    LintReport, LintSeverity, Stats, TaskGroupStats,
+};
 
 pub(crate) fn ms(ns: u64) -> String {
     if ns >= 1_000_000 {
@@ -159,6 +162,237 @@ pub fn render_lint(report: &LintReport) {
         if errors == 1 { "" } else { "s" },
         if warnings == 1 { "" } else { "s" },
     );
+}
+
+pub fn render_latency(report: &LatencyReport) {
+    let pct = |ns: u64| {
+        if report.total_ns == 0 {
+            0.0
+        } else {
+            ns as f64 * 100.0 / report.total_ns as f64
+        }
+    };
+    println!(
+        "task {}: {} from spawn (+{}) to {}",
+        report.task.label(),
+        ms(report.total_ns),
+        ms(report.from_ts),
+        if report.to_ts == report.from_ts + report.total_ns {
+            "end"
+        } else {
+            "now"
+        },
+    );
+    println!();
+    let row = |label: &str, ns: u64, extra: &str| {
+        println!("  {label:<14} {:>10}  {:>5.1}%{extra}", ms(ns), pct(ns));
+    };
+    row(
+        "own polls",
+        report.own_poll_ns,
+        &format!(
+            "  ({} poll{})",
+            report.poll_count,
+            if report.poll_count == 1 { "" } else { "s" }
+        ),
+    );
+    row("resource wait", report.resource_wait_ns, "");
+    row("timer wait", report.timer_wait_ns, "");
+    row("scheduler lag", report.sched_lag_ns, "  (woken → polled)");
+    row("idle/other", report.idle_ns, "");
+
+    if report.waits.is_empty() {
+        return;
+    }
+    println!();
+    println!("top waits:");
+    for (i, w) in report.waits.iter().enumerate() {
+        let timer = if w.is_timer { " [timer]" } else { "" };
+        println!(
+            "  {}. {:>10}  {} [{}] at +{}{timer}",
+            i + 1,
+            ms(w.wait_ns),
+            w.resource.label(),
+            w.op_name,
+            ms(w.since_ts),
+        );
+        if w.sched_lag_ns > 0 {
+            println!(
+                "       └ +{} scheduler lag after the wake",
+                ms(w.sched_lag_ns)
+            );
+        }
+        if let Some(h) = &w.holder {
+            let doing = if let Some(next) = &h.parked_on {
+                format!(
+                    "itself parked {} on {} — the chain continues there",
+                    ms(h.parked_ns),
+                    next.label(),
+                )
+            } else if h.polling_ns * 10 >= w.wait_ns.max(1) * 6 {
+                format!(
+                    "inside poll for {} of the wait — busy (blocking in async?)",
+                    ms(h.polling_ns),
+                )
+            } else {
+                format!(
+                    "polling {} / parked {} during the wait",
+                    ms(h.polling_ns),
+                    ms(h.parked_ns),
+                )
+            };
+            println!("       └ held by {}: {doing}", h.task.label());
+        }
+    }
+}
+
+pub fn render_diff(report: &DiffReport) {
+    let delta = |b: u64, c: u64| -> String {
+        if b == c {
+            "=".into()
+        } else if b == 0 {
+            format!("{} → {}", ms(b), ms(c))
+        } else {
+            format!("{} → {} (×{:.1})", ms(b), ms(c), c as f64 / b as f64)
+        }
+    };
+
+    println!(
+        "baseline: {} span, {} tasks, {} poll, {} wait{}",
+        ms(report.baseline.duration_ns),
+        report.baseline.task_count,
+        ms(report.baseline.total_poll_ns),
+        ms(report.baseline.total_wait_ns),
+        if report.baseline.deadlocks > 0 {
+            format!(", {} deadlock(s)", report.baseline.deadlocks)
+        } else {
+            String::new()
+        },
+    );
+    println!(
+        "current : {} span, {} tasks, {} poll, {} wait{}",
+        ms(report.current.duration_ns),
+        report.current.task_count,
+        ms(report.current.total_poll_ns),
+        ms(report.current.total_wait_ns),
+        if report.current.deadlocks > 0 {
+            format!(", {} deadlock(s)", report.current.deadlocks)
+        } else {
+            String::new()
+        },
+    );
+
+    if report.findings.is_empty() {
+        println!();
+        println!("✓ no behavioral changes beyond the thresholds.");
+    }
+
+    for f in &report.findings {
+        let tag = match f.severity {
+            DiffSeverity::Error => "⛔ error",
+            DiffSeverity::Warning => "⚠ regression",
+            DiffSeverity::Info => "✓ note",
+        };
+        match &f.kind {
+            DiffKind::NewDeadlock { cycle } => {
+                println!(
+                    "{tag}: NEW DEADLOCK — cycle: {} → (back to start); not present in baseline",
+                    cycle.join(" → "),
+                );
+            }
+            DiffKind::FixedDeadlock { cycle } => {
+                println!(
+                    "{tag}: deadlock fixed — baseline cycle {} is gone",
+                    cycle.join(" → "),
+                );
+            }
+            DiffKind::PollRegression {
+                key,
+                baseline_ns,
+                current_ns,
+            } => {
+                println!(
+                    "{tag}: {key} mean poll time {}",
+                    delta(*baseline_ns, *current_ns),
+                );
+            }
+            DiffKind::WaitRegression {
+                key,
+                baseline_ns,
+                current_ns,
+            } => {
+                println!(
+                    "{tag}: {key} mean wait time {}",
+                    delta(*baseline_ns, *current_ns),
+                );
+            }
+            DiffKind::NewSaturation {
+                key,
+                capacity,
+                max_depth,
+            } => {
+                println!(
+                    "{tag}: {key} newly saturated — peaked at {max_depth}/{capacity} \
+                     (baseline never hit capacity)",
+                );
+            }
+            DiffKind::PollImprovement {
+                key,
+                baseline_ns,
+                current_ns,
+            } => {
+                println!(
+                    "{tag}: {key} mean poll time improved {}",
+                    delta(*baseline_ns, *current_ns),
+                );
+            }
+            DiffKind::WaitImprovement {
+                key,
+                baseline_ns,
+                current_ns,
+            } => {
+                println!(
+                    "{tag}: {key} mean wait time improved {}",
+                    delta(*baseline_ns, *current_ns),
+                );
+            }
+            DiffKind::NewTaskGroup { key } => {
+                println!("{tag}: new task group in current run: {key}");
+            }
+            DiffKind::RemovedTaskGroup { key } => {
+                println!("{tag}: task group gone from current run: {key}");
+            }
+        }
+    }
+
+    // The biggest movers, for context under the verdicts.
+    let moved: Vec<_> = report
+        .task_groups
+        .iter()
+        .filter(|g| g.baseline.is_some() || g.current.is_some())
+        .take(8)
+        .collect();
+    if !moved.is_empty() {
+        println!();
+        println!("task groups (biggest change first):");
+        let side = |s: &Option<TaskGroupStats>| match s {
+            Some(s) => format!(
+                "n={} poll {} wait {}",
+                s.instances,
+                ms(s.mean_poll_ns()),
+                ms(s.mean_wait_ns()),
+            ),
+            None => "—".to_string(),
+        };
+        for g in moved {
+            println!(
+                "  {:<28} {}  |  {}",
+                g.key,
+                side(&g.baseline),
+                side(&g.current),
+            );
+        }
+    }
 }
 
 pub fn render_stats(stats: &Stats) {
