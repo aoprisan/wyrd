@@ -8,6 +8,14 @@ answer async causality questions over them.
 - `why_blocked(task, t)` — walk the park → resource → holder chain, detecting
   **deadlock cycles**.
 - `stats` — task counts, poll-time percentiles, longest parks, channel depths.
+- `why_slow(task, t)` — **causal latency attribution**: decompose a task's
+  lifetime into own poll time, resource waits (each blamed on the holder,
+  with what the holder was doing during the wait), timer waits, scheduler
+  lag (woken → polled, from tokio's waker events), and idle.
+- `diff(baseline, current)` — **regression detection** between two runs:
+  align tasks/resources by stable identity (name / `Type@file:line`),
+  compare per-instance behavior, and report new deadlocks (errors),
+  poll/wait regressions and new saturation (warnings), improvements (info).
 
 ```rust
 let rec = wyrd_core::Recording::open("run.wyrd")?;

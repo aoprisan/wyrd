@@ -103,7 +103,7 @@ pub(crate) fn max_ts(conn: &Connection) -> Result<u64, CoreError> {
     Ok(v.unwrap_or(0) as u64)
 }
 
-fn min_ts(conn: &Connection) -> Result<u64, CoreError> {
+pub(crate) fn min_ts(conn: &Connection) -> Result<u64, CoreError> {
     let v: Option<i64> = conn.query_row(
         "SELECT MIN(t) FROM (
             SELECT MIN(spawn_ts) t FROM tasks UNION ALL

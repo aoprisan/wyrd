@@ -86,10 +86,16 @@ fn initialize_result(params: &Value) -> Value {
             Start with `lint` for a triaged list of findings (deadlocks, \
             blocking-in-async, long parks, saturated channels) or `stats` for \
             an overview, then `why_blocked` to walk a stuck task's park → \
-            resource → holder chain (it names deadlock cycles). `world_state` \
-            lists every task and resource at an instant; its task names are \
-            valid `task` selectors for `why_blocked`. All timestamps are \
-            nanoseconds since the start of the recording.",
+            resource → holder chain (it names deadlock cycles). Use \
+            `why_slow` to attribute a task's latency: own poll time vs \
+            resource waits (blamed on the holder and what it was doing) vs \
+            timer waits vs scheduler lag; when a wait's holder is itself \
+            parked, follow the chain by calling `why_slow` on the holder. \
+            Use `diff` to compare a baseline recording against a current one \
+            and get regression verdicts (new deadlocks, poll/wait growth, \
+            new saturation). `world_state` lists every task and resource at \
+            an instant; its task names are valid `task` selectors. All \
+            timestamps are nanoseconds since the start of the recording.",
     })
 }
 
@@ -121,6 +127,64 @@ fn tool_definitions() -> Value {
                     "at": at,
                 },
                 "required": ["recording"],
+            },
+        },
+        {
+            "name": "why_slow",
+            "description": "Attribute where a task's lifetime went: own poll \
+                time (its compute), waits on resources (each blamed on the \
+                holder, with what the holder was doing during the wait), \
+                intentional timer waits, scheduler lag (woken but not yet \
+                polled), and idle. When a wait's holder is itself parked on \
+                another resource, call why_slow on that holder to follow the \
+                latency chain. If no task is named, picks the task with the \
+                most parked time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recording": recording,
+                    "task": {
+                        "type": "string",
+                        "description": "Task selector: a `task::Builder` name or numeric span id",
+                    },
+                    "at": at,
+                    "top": {
+                        "type": "integer",
+                        "description": "How many top wait episodes to include (default 5)",
+                    },
+                },
+                "required": ["recording"],
+            },
+        },
+        {
+            "name": "diff",
+            "description": "Compare two recordings — a known-good baseline \
+                and the current run — aligning tasks and resources by stable \
+                identity (name / type@file:line), and report verdicts: new \
+                deadlocks (error), mean poll/wait time regressions and newly \
+                saturated channels (warning), improvements (info). Use this \
+                to judge whether a change made async behavior worse.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "baseline": {
+                        "type": "string",
+                        "description": "Path to the known-good .wyrd recording",
+                    },
+                    "current": {
+                        "type": "string",
+                        "description": "Path to the .wyrd recording to judge",
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "description": "Relative growth needed to flag a regression (default 1.5 = +50%)",
+                    },
+                    "floor_ms": {
+                        "type": "number",
+                        "description": "Absolute growth (ms) needed to flag (default 1)",
+                    },
+                },
+                "required": ["baseline", "current"],
             },
         },
         {
@@ -207,6 +271,33 @@ fn call_tool(params: &Value) -> Value {
 }
 
 fn run_tool(name: &str, args: &Value) -> Result<Value, String> {
+    // `diff` reads two recordings, not one — handled before the common open.
+    if name == "diff" {
+        let open = |key: &str| -> Result<Recording, String> {
+            let path = args
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or(format!("missing required argument: {key}"))?;
+            Recording::open(path).map_err(|e| format!("cannot open {path}: {e}"))
+        };
+        let base = open("baseline")?;
+        let cur = open("current")?;
+        let defaults = wyrd_core::model::DiffConfig::default();
+        let config = wyrd_core::model::DiffConfig {
+            ratio: args
+                .get("ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(defaults.ratio),
+            abs_floor_ns: args
+                .get("floor_ms")
+                .and_then(Value::as_f64)
+                .map(|ms| (ms * 1e6) as u64)
+                .unwrap_or(defaults.abs_floor_ns),
+        };
+        let report = wyrd_core::diff(&base, &cur, &config).map_err(|e| e.to_string())?;
+        return serde_json::to_value(report).map_err(|e| format!("serialize result: {e}"));
+    }
+
     let path = args
         .get("recording")
         .and_then(Value::as_str)
@@ -224,6 +315,17 @@ fn run_tool(name: &str, args: &Value) -> Result<Value, String> {
                     .ok_or("recording contains no tasks")?,
             };
             serde_json::to_value(rec.why_blocked(task, at).map_err(|e| e.to_string())?)
+        }
+        "why_slow" => {
+            let task = match args.get("task").and_then(Value::as_str) {
+                Some(sel) => rec.resolve_task(sel).map_err(|e| e.to_string())?,
+                None => rec
+                    .pick_slow_task(at)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("recording contains no tasks")?,
+            };
+            let top = args.get("top").and_then(Value::as_u64).unwrap_or(5) as usize;
+            serde_json::to_value(rec.why_slow(task, at, top).map_err(|e| e.to_string())?)
         }
         "stats" => {
             let top = args.get("top").and_then(Value::as_u64).unwrap_or(10) as usize;

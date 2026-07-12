@@ -5,12 +5,23 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server over
 *why is this async task stuck?* against a `.wyrd` file.
 
 Speaks MCP's stdio transport (newline-delimited JSON-RPC 2.0) and exposes
-three tools, all taking a `recording` path:
+six tools:
 
 - **`why_blocked`** — walk a task's park → resource → holder chain and name
   the outcome: a deadlock cycle, an active holder that hasn't released, or a
   backpressure/timer root. Auto-picks an interesting parked task if none is
   named.
+- **`why_slow`** — attribute a task's lifetime: own poll time, resource waits
+  (each blamed on the holder, with what the holder was doing during the
+  wait), timer waits, scheduler lag (woken → polled), idle. When a holder is
+  itself parked, the report names the next resource — call `why_slow` on the
+  holder to follow the latency chain.
+- **`diff`** — compare a `baseline` recording against a `current` one by
+  stable task/resource identity and report verdicts: new deadlocks (error),
+  mean poll/wait regressions and newly saturated channels (warnings),
+  improvements (info).
+- **`lint`** — triaged findings: deadlocks (errors), blocking-in-async long
+  polls, long non-timer parks, saturated channels (warnings).
 - **`stats`** — recording span, task count, poll-time percentiles, longest
   parks, peak channel depths.
 - **`world_state`** — every task and resource with its status, optionally at

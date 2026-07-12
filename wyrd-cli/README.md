@@ -1,7 +1,8 @@
 # wyrd
 
 The command-line analyzer for [wyrd](https://github.com/aoprisan/wyrd)
-recordings — *why is this async task stuck?*
+recordings — *why is this async task stuck? where did its time go? did my
+change make things worse?*
 
 ```console
 $ cargo install wyrd-cli        # installs the `wyrd` binary (pure stable Rust)
@@ -20,7 +21,13 @@ channel depths : ...
 ```
 
 `wyrd why-blocked <file> [--task NAME|ID] [--at TS] [--json]` (exit code 2 on a
-detected deadlock) and `wyrd stats <file> [--top N] [--json]`. `wyrd lint
+detected deadlock) and `wyrd stats <file> [--top N] [--json]`. `wyrd why-slow
+<file> [--task NAME|ID]` attributes a task's latency — own poll time vs
+resource waits (blamed on the holder, with what the holder was doing) vs timer
+waits vs scheduler lag — and `wyrd diff <baseline> <current> [--ratio R]
+[--floor-ms MS]` compares two runs by stable task/resource identity, exiting 2
+on a new deadlock and 1 on poll/wait regressions or new channel saturation
+(gate CI with it: record a baseline on main, diff on every PR). `wyrd lint
 <file>` distills the folds into triaged findings — deadlocks (errors),
 blocking-in-async long polls, long non-timer parks, saturated channels — with
 CI-friendly exit codes (2 errors / 1 warnings / 0 clean). For interactive

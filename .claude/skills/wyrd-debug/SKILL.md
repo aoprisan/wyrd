@@ -1,6 +1,6 @@
 ---
 name: wyrd-debug
-description: Diagnose stuck, deadlocked, or slow tokio applications with wyrd. Use when the user reports a hung/deadlocked async app, mutex contention, channel backpressure, or asks "why is this task stuck?", or when a .wyrd recording file needs inspecting.
+description: Diagnose stuck, deadlocked, or slow tokio applications with wyrd. Use when the user reports a hung/deadlocked async app, mutex contention, channel backpressure, asks "why is this task stuck?" or "why is this slow?", wants two runs compared for async regressions, or when a .wyrd recording file needs inspecting.
 ---
 
 # Debugging tokio apps with wyrd
@@ -55,25 +55,31 @@ If a recording is empty or reports nothing, the usual cause is a missing
 ## 2. Inspecting a recording
 
 The repo's `.mcp.json` registers the `wyrd` MCP server (`cargo run -p
-wyrd-mcp`), which exposes four tools. All take a `recording` path; timestamps
-are ns since recording start.
+wyrd-mcp`), which exposes six tools. All but `diff` take a `recording` path;
+timestamps are ns since recording start.
 
 | tool | use it to |
 |------|-----------|
 | `lint` | triage first: deadlocks (errors), blocking-in-async long polls, long non-timer parks, saturated channels — with tunable `long_poll_ms` / `long_park_ms` |
 | `stats` | orient: duration, task count, poll percentiles, longest parks, peak channel depths |
 | `why_blocked` | explain one task's blockage; omit `task` to auto-pick the most interesting parked task, or pass a task name / span id from `world_state` |
+| `why_slow` | attribute one task's *latency*: own poll time vs resource waits (blamed on the holder, with what the holder was doing) vs timer waits vs scheduler lag; omit `task` to pick the most-parked task |
+| `diff` | compare a `baseline` recording against a `current` one by stable task/resource identity: new deadlocks (error), mean poll/wait regressions and new saturation (warnings), improvements (info) |
 | `world_state` | list every task (running/idle/parked/done) and resource (holder, locked, permits, depth), optionally at a timestamp `at` |
 
-Start with `lint` — its findings usually *are* the answer. Otherwise `stats`;
-long parks there tell you which tasks to feed to `why_blocked`. Use
-`world_state` with `at` to replay how the situation developed over time.
+Start with `lint` — its findings usually *are* the answer. For "why is it
+slow?" go straight to `why_slow`; when a wait's holder is itself parked, the
+report names the next resource — call `why_slow` on the holder to follow the
+chain. For "did my change make things worse?" record both runs and `diff`
+them. Use `world_state` with `at` to replay how a situation developed.
 
 CLI fallback (same queries, `--json` for structured output):
 
 ```console
 $ cargo run -p wyrd-cli -- lint run.wyrd [--long-poll-ms MS] [--long-park-ms MS] [--json]
 $ cargo run -p wyrd-cli -- why-blocked run.wyrd [--task NAME|ID] [--at NS] [--json]
+$ cargo run -p wyrd-cli -- why-slow run.wyrd [--task NAME|ID] [--at NS] [--top N] [--json]
+$ cargo run -p wyrd-cli -- diff baseline.wyrd current.wyrd [--ratio R] [--floor-ms MS] [--json]
 $ cargo run -p wyrd-cli -- stats run.wyrd [--top N] [--json]
 ```
 

@@ -39,6 +39,44 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Explain where a task's time went: own poll time, resource waits blamed
+    /// on their holders, timer waits, scheduler lag (woken → polled), idle.
+    WhySlow {
+        /// The recording file.
+        file: PathBuf,
+        /// Task to inspect, by `task::Builder` name or span id. Defaults to
+        /// the task with the most time spent parked.
+        #[arg(long)]
+        task: Option<String>,
+        /// Timestamp (ns) to clip the window at. Defaults to end-of-recording.
+        #[arg(long)]
+        at: Option<u64>,
+        /// How many top wait episodes to show.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two recordings (baseline vs current) by stable task/resource
+    /// identity and report regressions: new deadlocks (exit 2), poll/wait
+    /// growth and new saturation (exit 1), improvements (exit 0). Built to
+    /// gate CI: record a baseline on main, diff against it on every PR.
+    Diff {
+        /// The known-good recording.
+        baseline: PathBuf,
+        /// The recording to judge.
+        current: PathBuf,
+        /// Relative growth needed to flag a regression (1.5 = +50%).
+        #[arg(long, default_value_t = 1.5)]
+        ratio: f64,
+        /// Absolute growth (ms) needed to flag — silences noise on tiny values.
+        #[arg(long, default_value_t = 1.0)]
+        floor_ms: f64,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Summarize a recording: task count, poll-time percentiles, longest parks,
     /// channel depths.
     Stats {
@@ -141,6 +179,55 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             // Exit code 2 on a detected deadlock, so scripts/tests can gate.
             Ok(if report.is_deadlock() {
                 ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::WhySlow {
+            file,
+            task,
+            at,
+            top,
+            json,
+        } => {
+            let rec = Recording::open(&file)?;
+            let task_id = match task {
+                Some(sel) => rec.resolve_task(&sel)?,
+                None => rec
+                    .pick_slow_task(at)?
+                    .ok_or("recording contains no tasks")?,
+            };
+            let report = rec.why_slow(task_id, at, top)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render::render_latency(&report);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Diff {
+            baseline,
+            current,
+            ratio,
+            floor_ms,
+            json,
+        } => {
+            let base = Recording::open(&baseline)?;
+            let cur = Recording::open(&current)?;
+            let config = wyrd_core::model::DiffConfig {
+                ratio,
+                abs_floor_ns: (floor_ms * 1e6) as u64,
+            };
+            let report = wyrd_core::diff(&base, &cur, &config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render::render_diff(&report);
+            }
+            Ok(if report.has_errors() {
+                ExitCode::from(2)
+            } else if report.has_regressions() {
+                ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
             })
