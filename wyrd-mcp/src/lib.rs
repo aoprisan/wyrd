@@ -93,7 +93,12 @@ fn initialize_result(params: &Value) -> Value {
             parked, follow the chain by calling `why_slow` on the holder. \
             Use `diff` to compare a baseline recording against a current one \
             and get regression verdicts (new deadlocks, poll/wait growth, \
-            new saturation). `world_state` lists every task and resource at \
+            new saturation). Use `predict` on any recording — including a \
+            clean, passing run — to find *latent* deadlocks: lock-order \
+            inversions (tasks acquiring the same locks in conflicting \
+            orders) that did not fire this time but can under another \
+            interleaving; report these even when `lint` is clean. \
+            `world_state` lists every task and resource at \
             an instant; its task names are valid `task` selectors. All \
             timestamps are nanoseconds since the start of the recording.",
     })
@@ -229,6 +234,34 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "predict",
+            "description": "Detect potential deadlocks that did NOT happen: \
+                lock-order inversions — distinct tasks observed acquiring the \
+                same locks in conflicting orders with no common gate lock — \
+                anywhere in the recording, even a clean run that never \
+                deadlocked. Each cycle names the locks (with source \
+                locations) and a witnessing task per hop; cycles that did \
+                deadlock in this run are marked `observed`. Call this on \
+                passing runs too: it finds bugs `lint` and `why_blocked` \
+                cannot see.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recording": recording,
+                    "at": at,
+                    "max_cycle_len": {
+                        "type": "integer",
+                        "description": "Longest lock-order cycle to search for (default 4)",
+                    },
+                    "max_cycles": {
+                        "type": "integer",
+                        "description": "At most this many cycles in the report (default 16)",
+                    },
+                },
+                "required": ["recording"],
+            },
+        },
+        {
             "name": "world_state",
             "description": "Snapshot every task (running/idle/parked/done) \
                 and resource (holder, locked, permits, depth) at an instant. \
@@ -345,6 +378,22 @@ fn run_tool(name: &str, args: &Value) -> Result<Value, String> {
                     .unwrap_or(defaults.long_park_ns),
             };
             serde_json::to_value(rec.lint(at, &config).map_err(|e| e.to_string())?)
+        }
+        "predict" => {
+            let defaults = wyrd_core::model::PredictConfig::default();
+            let config = wyrd_core::model::PredictConfig {
+                max_cycle_len: args
+                    .get("max_cycle_len")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or(defaults.max_cycle_len),
+                max_cycles: args
+                    .get("max_cycles")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or(defaults.max_cycles),
+            };
+            serde_json::to_value(rec.predict(at, &config).map_err(|e| e.to_string())?)
         }
         "world_state" => serde_json::to_value(rec.world_state(at).map_err(|e| e.to_string())?),
         other => return Err(format!("unknown tool: {other}")),

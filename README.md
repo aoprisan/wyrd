@@ -4,15 +4,21 @@
 tokio's own instrumentation knows about your tasks and resources, then lets you
 ask *why is this task stuck?* — walking the park → resource → holder chain and
 naming deadlocks — *where did this task's time go?* (`wyrd why-slow`: latency
-attribution that blames each wait on its holder), and *did my change make
-async behavior worse?* (`wyrd diff`: regression verdicts between two runs).
+attribution that blames each wait on its holder), *did my change make
+async behavior worse?* (`wyrd diff`: regression verdicts between two runs) —
+and, uniquely, *what deadlock is hiding in this run that passed?*
+(`wyrd predict`: lock-order-inversion detection from clean recordings, and
+`wyrd hunt`: a seeded concurrency fuzzer that provokes the interleavings your
+tests never hit).
 
-> Phases 1–4: the instrumentation layer, event recording, one-shot
+> Phases 1–5: the instrumentation layer, event recording, one-shot
 > `wyrd why-blocked` / `wyrd stats` / `wyrd lint` commands, an interactive
 > `wyrd tui` for browsing a recording (stats, tasks, spawn tree, resources,
 > why-blocked) with a scrubbable time cursor, a headless `wyrd watch`
 > for CI-style live monitoring, causal latency attribution (`wyrd why-slow`),
-> and run-over-run regression diffing (`wyrd diff`).
+> run-over-run regression diffing (`wyrd diff`), potential-deadlock
+> prediction from passing runs (`wyrd predict`), and schedule-perturbation
+> fuzzing (`wyrd hunt` + wyrd-shim chaos mode).
 
 ## Workspace
 
@@ -20,9 +26,9 @@ async behavior worse?* (`wyrd diff`: regression verdicts between two runs).
 |-------|------------|
 | [`wyrd-weave`](wyrd-weave) | a `tracing_subscriber::Layer` that normalizes tokio's internal spans/events into a compact causality event stream, written to disk on a dedicated writer thread. |
 | [`wyrd-core`](wyrd-core) | ingests recordings into SQLite; world-state fold + `why_blocked` / `stats` queries returning serde structs. |
-| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `why-blocked`, `why-slow`, `diff`, `stats`, `lint`, `watch`, and `wyrd tui <recording>` (interactive [ratatui](https://ratatui.rs) viewer). |
-| [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `why_slow`, `diff`, `stats`, `lint`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
-| [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable` (see below). |
+| [`wyrd-cli`](wyrd-cli) | the `wyrd` binary: `why-blocked`, `why-slow`, `diff`, `stats`, `lint`, `predict`, `hunt`, `watch`, and `wyrd tui <recording>` (interactive [ratatui](https://ratatui.rs) viewer). |
+| [`wyrd-mcp`](wyrd-mcp) | an MCP server exposing the same queries (`why_blocked`, `why_slow`, `diff`, `stats`, `lint`, `predict`, `world_state`) to AI agents over stdio (see [below](#asking-an-ai-agent-mcp--claude-code)). |
+| [`wyrd-shim`](wyrd-shim) | **stable-Rust** `spawn` / `Mutex` / `mpsc` wrappers that record the same events **without** `tokio_unstable`, plus env-driven [chaos mode](#hunting-latent-races-wyrd-hunt--chaos-mode) (see below). |
 | [`examples/demo`](examples/demo) | a tokio app exhibiting a spawn tree, mutex contention, mpsc backpressure, and an intentional two-mutex deadlock. |
 | [`examples/axum`](examples/axum) | an axum server whose handler holds a shared mutex across an `.await`, so requests serialize — self-driving, produces a recording you can inspect. |
 
@@ -121,6 +127,88 @@ codes gate CI: `2` on a new deadlock, `1` on regressions (poll/wait growth,
 newly saturated channels), `0` when clean or improved. Record a baseline on
 `main`, record on the PR, `wyrd diff` the pair — async behavior is now a
 reviewable, gateable artifact.
+
+## Predicting deadlocks that didn't happen (`wyrd predict`)
+
+Everything above is forensic: it explains a failure the recording already
+contains. `wyrd predict` is proactive — it finds the deadlock hiding in a run
+that **passed**. From the recorded holder state it reconstructs which locks
+each task *held while acquiring* others, builds the lock-order graph, and
+reports cycles: tasks acquiring the same locks in conflicting orders. That is
+a deadlock waiting for the right interleaving, even if this run — and every
+run your test suite will ever do — sails through:
+
+```console
+$ cargo run -p wyrd-shim --example inversion -- run.wyrd
+completed cleanly (the inversion is still latent — run `wyrd predict`)
+
+$ wyrd predict run.wyrd
+⚠ POTENTIAL DEADLOCK — 2-lock cycle acquired in conflicting orders (did not fire in this run):
+  Mutex@wyrd-shim/examples/inversion.rs:33 → Mutex@wyrd-shim/examples/inversion.rs:34
+    worker-ab held Mutex@…/inversion.rs:33 while taking Mutex@…/inversion.rs:34 [acquire] at +162.8µs
+    worker-ba held Mutex@…/inversion.rs:34 while taking Mutex@…/inversion.rs:33 [acquire] at +2.4ms
+
+analyzed 160 acquisitions across 2 lock(s); 2 order edge(s); 1 cycle(s) reported, …
+fix: make every task acquire these locks in one canonical order (or merge them / guard both orders behind a common gate lock).
+```
+
+This is the classic lock-order-inversion ("Goodlock") analysis, with the two
+standard false-positive filters: cycles whose every edge comes from a single
+task are suppressed (it can't deadlock with itself), and cycles serialized by
+a common *gate lock* held across all witnesses are suppressed (the order
+conflict can never manifest). Cycles that *did* deadlock in the recording are
+marked `observed`. Exit codes gate CI: `2` observed, `1` latent, `0` clean —
+run it on the recording of any passing test and fail the build on lock-order
+inversions nobody has hit yet.
+
+## Hunting latent races (`wyrd hunt` + chaos mode)
+
+`predict` finds inversions the schedule happened to expose. `wyrd hunt` goes
+looking for trouble: it runs your (shim-instrumented) binary many times under
+**chaos mode** — seeded schedule perturbation that injects tiny randomized
+delays right before lock/channel acquisitions and at task startup, widening
+the race windows your scheduler normally jumps over — with a hang watchdog,
+then analyzes every run's recording and aggregates findings across seeds:
+
+```console
+$ wyrd hunt --runs 16 -- target/debug/examples/inversion
+  seed    1          exit 3   5010.2ms  ⛔ 1 deadlock(s)
+  seed    2          exit 0    111.4ms  ⚠ 1 latent cycle(s)
+  ...
+
+hunted `target/debug/examples/inversion` × 16 runs: 0 hung, 9 deadlocked, 1 distinct cycle(s)
+
+⛔ cycle DEADLOCKED under seed(s) [1, 3, 7, …]: Mutex@…/inversion.rs:33 ↔ Mutex@…/inversion.rs:34
+    • worker-ab parked on Mutex@…/inversion.rs:34
+    • worker-ba parked on Mutex@…/inversion.rs:33
+    ↳ inspect: wyrd why-blocked /tmp/wyrd-hunt-1234/hunt-1.wyrd   (or wyrd predict …)
+
+verdict: reproduced — recordings for failing seeds kept in /tmp/wyrd-hunt-1234
+```
+
+Chaos mode is configured entirely through the environment — any
+shim-instrumented binary becomes fuzzable without a rebuild:
+
+| variable | meaning | default |
+|---|---|---|
+| `WYRD_CHAOS` | `1`/`true`/`on` enables chaos | off |
+| `WYRD_CHAOS_SEED` | seed for the delay stream (a seed that provokes a bug keeps provoking it) | `0x5EED` |
+| `WYRD_CHAOS_PROB` | per-site injection probability | `0.25` |
+| `WYRD_CHAOS_MAX_DELAY_US` | max injected delay, µs (0 = yield only) | `500` |
+
+`hunt` sets these per run (seed = `--seed-start + index`) plus `WYRD_RECORD`
+with the per-seed recording path — have the target call
+`wyrd_shim::init_from_env()` to pick both up. Runs that hang are killed by the
+watchdog (`--timeout-s`) and counted as the strongest failure signal; their
+recordings are still analyzable, because the writer thread flushes on idle
+precisely so a deadlocked-then-killed process leaves its evidence on disk.
+Findings are keyed by the resources' stable `Type@file:line` identity, so the
+same cycle observed under different seeds folds into one report line. Exit
+codes: `2` if any run hung or deadlocked, `1` if only latent cycles were
+found, `0` clean. Where [loom](https://github.com/tokio-rs/loom) exhaustively
+model-checks code rewritten against its simulated types, `hunt` fuzzes your
+*real* binary on the *real* tokio runtime — no test harness rewrite, just the
+shim wrappers you already record with.
 
 ## Linting a recording (`wyrd lint`)
 
@@ -272,7 +360,8 @@ either. (Not yet published to crates.io; once it is, this becomes
 so an agent can inspect recordings itself: `lint` for triaged findings,
 `stats` to orient, `why_blocked` to walk the park → holder chain (deadlock
 cycles included), `why_slow` to attribute a task's latency (and follow the
-blame chain holder by holder), `diff` to judge a run against a baseline, and
+blame chain holder by holder), `diff` to judge a run against a baseline,
+`predict` to surface latent lock-order inversions even in a clean run, and
 `world_state` to snapshot every task/resource at a
 timestamp. Results carry both readable text
 and `structuredContent` — the same serde structs the CLI prints with `--json`.

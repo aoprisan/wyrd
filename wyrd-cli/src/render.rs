@@ -2,7 +2,7 @@
 
 use wyrd_core::model::{
     BlockedOutcome, BlockedReport, DiffKind, DiffReport, DiffSeverity, LatencyReport, LintKind,
-    LintReport, LintSeverity, Stats, TaskGroupStats,
+    LintReport, LintSeverity, PredictReport, Stats, TaskGroupStats,
 };
 
 pub(crate) fn ms(ns: u64) -> String {
@@ -161,6 +161,67 @@ pub fn render_lint(report: &LintReport) {
         if report.findings.len() == 1 { "" } else { "s" },
         if errors == 1 { "" } else { "s" },
         if warnings == 1 { "" } else { "s" },
+    );
+}
+
+pub fn render_predict(report: &PredictReport) {
+    if report.cycles.is_empty() {
+        println!(
+            "✓ no lock-order inversions: {} acquisitions across {} lock(s), {} order edge(s), \
+             all consistent.",
+            report.acquisitions, report.lock_count, report.order_edges,
+        );
+        if report.guarded_suppressed > 0 || report.single_task_suppressed > 0 {
+            println!(
+                "  ({} gate-locked and {} single-task cycle(s) suppressed as unable to deadlock)",
+                report.guarded_suppressed, report.single_task_suppressed,
+            );
+        }
+        return;
+    }
+
+    for c in &report.cycles {
+        let labels: Vec<String> = c.resources.iter().map(|r| r.label()).collect();
+        if c.observed {
+            println!(
+                "⛔ DEADLOCK (observed in this run) — {}-lock cycle: {}",
+                c.resources.len(),
+                labels.join(" → "),
+            );
+        } else {
+            println!(
+                "⚠ POTENTIAL DEADLOCK — {}-lock cycle acquired in conflicting orders \
+                 (did not fire in this run): {}",
+                c.resources.len(),
+                labels.join(" → "),
+            );
+        }
+        for e in &c.edges {
+            println!(
+                "    {task} held {held} while taking {next} [{op}] at +{at}",
+                task = e.task.label(),
+                held = e.held.label(),
+                next = e.acquiring.label(),
+                op = e.op_name,
+                at = ms(e.at),
+            );
+        }
+        println!();
+    }
+
+    println!(
+        "analyzed {} acquisitions across {} lock(s); {} order edge(s); \
+         {} cycle(s) reported, {} gate-locked and {} single-task suppressed",
+        report.acquisitions,
+        report.lock_count,
+        report.order_edges,
+        report.cycles.len(),
+        report.guarded_suppressed,
+        report.single_task_suppressed,
+    );
+    println!(
+        "fix: make every task acquire these locks in one canonical order \
+         (or merge them / guard both orders behind a common gate lock)."
     );
 }
 

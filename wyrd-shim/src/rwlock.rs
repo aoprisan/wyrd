@@ -85,6 +85,7 @@ impl<T> RwLock<T> {
     /// Acquire a shared read guard, recording a park iff a writer holds the
     /// lock (or writers are queued ahead).
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
+        crate::chaos::chaos_point().await;
         let guard = match self.inner.try_read() {
             Ok(g) => g,
             Err(_) => {
@@ -107,6 +108,7 @@ impl<T> RwLock<T> {
 
     /// Acquire the exclusive write guard, recording a park iff contended.
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
+        crate::chaos::chaos_point().await;
         let guard = match self.inner.try_write() {
             Ok(g) => g,
             Err(_) => {

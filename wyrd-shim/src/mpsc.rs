@@ -68,6 +68,7 @@ impl<T> Sender<T> {
 
     /// Send a value, recording a park if the channel is full (backpressure).
     pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
+        crate::chaos::chaos_point().await;
         let task = current_task();
         match self.inner.try_send(value) {
             Ok(()) => {

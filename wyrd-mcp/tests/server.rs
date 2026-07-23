@@ -128,6 +128,7 @@ fn lists_the_tools() {
             "diff",
             "stats",
             "lint",
+            "predict",
             "world_state"
         ]
     );
@@ -138,6 +139,24 @@ fn lists_the_tools() {
             json!(["recording"])
         };
         assert_eq!(tool["inputSchema"]["required"], required);
+    }
+}
+
+#[test]
+fn predict_reports_the_cycle_as_observed() {
+    let path = deadlock_recording_file("predict");
+    let result = call_tool("predict", json!({ "recording": &path }));
+    assert_eq!(result["isError"], false, "got: {result}");
+
+    let report = &result["structuredContent"];
+    let cycles = report["cycles"].as_array().expect("cycles array");
+    assert_eq!(cycles.len(), 1, "got: {report}");
+    // The recording actually deadlocked, so the cycle is `observed`.
+    assert_eq!(cycles[0]["observed"], true);
+    assert_eq!(cycles[0]["resources"].as_array().unwrap().len(), 2);
+    // Each hop names a witnessing task.
+    for edge in cycles[0]["edges"].as_array().unwrap() {
+        assert!(edge["task"]["name"].is_string());
     }
 }
 

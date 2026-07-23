@@ -313,6 +313,85 @@ pub struct LatencyReport {
     pub waits: Vec<WaitEpisode>,
 }
 
+// --- predict: potential-deadlock detection ------------------------------------
+
+/// Bounds for [`predict`](crate::Recording::predict) cycle enumeration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredictConfig {
+    /// Longest lock-order cycle to search for (2 = classic ABBA inversion).
+    pub max_cycle_len: usize,
+    /// At most this many cycles in the report.
+    pub max_cycles: usize,
+}
+
+impl Default for PredictConfig {
+    fn default() -> Self {
+        Self {
+            max_cycle_len: 4,
+            max_cycles: 16,
+        }
+    }
+}
+
+/// One witnessed hop of a lock-order cycle: `task` held `held` while
+/// acquiring (or parking on) `acquiring` at `at`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockOrderEdge {
+    pub held: ResourceIdent,
+    pub acquiring: ResourceIdent,
+    pub task: TaskIdent,
+    /// When the acquisition attempt happened.
+    pub at: u64,
+    /// `acquire` for a successful take, else the park's op (`lock`,
+    /// `poll_acquire`, ...).
+    pub op_name: String,
+}
+
+/// A cycle in the lock-order graph: the recorded schedules acquired these
+/// resources in conflicting orders from distinct tasks, with no common gate
+/// lock serializing them — a deadlock waiting for the right interleaving.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredictedCycle {
+    /// The resources, in cycle order.
+    pub resources: Vec<ResourceIdent>,
+    /// One witness per hop (`resources[i]` held while taking
+    /// `resources[(i+1) % len]`).
+    pub edges: Vec<LockOrderEdge>,
+    /// Whether this resource set actually deadlocked in this recording.
+    pub observed: bool,
+}
+
+/// Result of a `predict` query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredictReport {
+    pub at: u64,
+    pub config: PredictConfig,
+    /// Acquisition attempts analyzed (successful acquires + contended parks).
+    pub acquisitions: u64,
+    /// Resources with holder tracking (locks the analysis can see).
+    pub lock_count: u64,
+    /// Distinct held-while-acquiring edges observed.
+    pub order_edges: u64,
+    /// Cycles that survived the filters, observed deadlocks first.
+    pub cycles: Vec<PredictedCycle>,
+    /// Cycles suppressed because a common gate lock serializes them.
+    pub guarded_suppressed: u64,
+    /// Cycles suppressed because a single task produced every edge.
+    pub single_task_suppressed: u64,
+}
+
+impl PredictReport {
+    /// Whether any reported cycle actually deadlocked in this recording.
+    pub fn has_observed_deadlock(&self) -> bool {
+        self.cycles.iter().any(|c| c.observed)
+    }
+
+    /// Whether any cycle was found at all (predicted or observed).
+    pub fn has_potential_deadlock(&self) -> bool {
+        !self.cycles.is_empty()
+    }
+}
+
 // --- diff: run-over-run regression detection ---------------------------------
 
 /// Thresholds for [`diff`](crate::diff) findings: a metric regresses when it

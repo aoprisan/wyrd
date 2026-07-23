@@ -55,7 +55,7 @@ If a recording is empty or reports nothing, the usual cause is a missing
 ## 2. Inspecting a recording
 
 The repo's `.mcp.json` registers the `wyrd` MCP server (`cargo run -p
-wyrd-mcp`), which exposes six tools. All but `diff` take a `recording` path;
+wyrd-mcp`), which exposes seven tools. All but `diff` take a `recording` path;
 timestamps are ns since recording start.
 
 | tool | use it to |
@@ -65,6 +65,7 @@ timestamps are ns since recording start.
 | `why_blocked` | explain one task's blockage; omit `task` to auto-pick the most interesting parked task, or pass a task name / span id from `world_state` |
 | `why_slow` | attribute one task's *latency*: own poll time vs resource waits (blamed on the holder, with what the holder was doing) vs timer waits vs scheduler lag; omit `task` to pick the most-parked task |
 | `diff` | compare a `baseline` recording against a `current` one by stable task/resource identity: new deadlocks (error), mean poll/wait regressions and new saturation (warnings), improvements (info) |
+| `predict` | find **latent** deadlocks in any recording — even a clean, passing run: lock-order inversions (distinct tasks acquiring the same locks in conflicting orders, no common gate lock), each cycle with per-hop witnesses and source locations; cycles that actually fired are marked `observed` |
 | `world_state` | list every task (running/idle/parked/done) and resource (holder, locked, permits, depth), optionally at a timestamp `at` |
 
 Start with `lint` — its findings usually *are* the answer. For "why is it
@@ -72,6 +73,10 @@ slow?" go straight to `why_slow`; when a wait's holder is itself parked, the
 report names the next resource — call `why_slow` on the holder to follow the
 chain. For "did my change make things worse?" record both runs and `diff`
 them. Use `world_state` with `at` to replay how a situation developed.
+**Always run `predict` before declaring a recording healthy** — a clean
+`lint` only means nothing fired *this* run; `predict` catches the deadlock
+that's one interleaving away, and its report names the canonical fix (a
+consistent acquisition order).
 
 CLI fallback (same queries, `--json` for structured output):
 
@@ -80,8 +85,21 @@ $ cargo run -p wyrd-cli -- lint run.wyrd [--long-poll-ms MS] [--long-park-ms MS]
 $ cargo run -p wyrd-cli -- why-blocked run.wyrd [--task NAME|ID] [--at NS] [--json]
 $ cargo run -p wyrd-cli -- why-slow run.wyrd [--task NAME|ID] [--at NS] [--top N] [--json]
 $ cargo run -p wyrd-cli -- diff baseline.wyrd current.wyrd [--ratio R] [--floor-ms MS] [--json]
+$ cargo run -p wyrd-cli -- predict run.wyrd [--at NS] [--max-cycle-len N] [--json]
 $ cargo run -p wyrd-cli -- stats run.wyrd [--top N] [--json]
 ```
+
+To actively *provoke* a suspected race instead of waiting for it, fuzz the
+(shim-instrumented, `wyrd_shim::init_from_env()`-calling) binary:
+
+```console
+$ cargo run -p wyrd-cli -- hunt --runs 16 [--timeout-s S] [--max-delay-us US] -- <cmd> [args…]
+```
+
+`hunt` re-runs the command under different chaos seeds (`WYRD_CHAOS_SEED`),
+kills hangs, analyzes every recording with lint + predict, and aggregates
+which seeds made each cycle fire; exit 2 = reproduced hang/deadlock, 1 =
+latent cycles only.
 
 `why-blocked` exits 2 when it detects a deadlock; `lint` exits 2 on errors
 (deadlocks) and 1 on warnings — useful in scripts/tests. To monitor a *running*

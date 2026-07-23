@@ -49,6 +49,7 @@ impl<T> Mutex<T> {
     /// Lock the mutex, recording a park iff the lock is contended and recording
     /// the acquirer as the holder.
     pub async fn lock(&self) -> MutexGuard<'_, T> {
+        crate::chaos::chaos_point().await;
         let task = current_task();
         let guard = match self.inner.try_lock() {
             // Uncontended: no park.

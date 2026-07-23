@@ -8,7 +8,7 @@
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -106,10 +106,19 @@ fn writer_loop<W: std::io::Write>(
     mut writer: FrameWriter<BufWriter<W>>,
     batch: usize,
 ) {
+    /// Flush after this much quiet, so a recording is analyzable even when
+    /// the process is killed mid-run (a deadlocked app goes quiet exactly
+    /// when its recording matters most).
+    const IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
+
+    // Put the header on disk immediately: a hung-then-killed process must
+    // still leave a readable (if truncated) recording.
+    let _ = writer.flush();
+
     let mut since_flush = 0usize;
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Record(record) => {
+    loop {
+        match rx.recv_timeout(IDLE_FLUSH) {
+            Ok(Msg::Record(record)) => {
                 if let Err(_e) = writer.write_record(&record) {
                     #[cfg(feature = "diag")]
                     tracing::error!(target: "wyrd::weave", error = %_e, "writer failed; stopping");
@@ -121,7 +130,14 @@ fn writer_loop<W: std::io::Write>(
                     since_flush = 0;
                 }
             }
-            Msg::Shutdown => break,
+            Ok(Msg::Shutdown) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if since_flush > 0 {
+                    let _ = writer.flush();
+                    since_flush = 0;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = writer.flush();
