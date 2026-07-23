@@ -68,6 +68,7 @@ impl Semaphore {
 
     /// Acquire one permit, recording a park iff none are free.
     pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
+        crate::chaos::chaos_point().await;
         let permit = match self.inner.try_acquire() {
             Ok(p) => p,
             Err(_) => {

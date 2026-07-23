@@ -40,6 +40,7 @@ use std::task::{Context, Poll};
 use pin_project_lite::pin_project;
 use wyrd_weave::{Event, FlushGuard, Loc, Recorder, TaskId, TaskKind};
 
+pub mod chaos;
 pub mod mpsc;
 mod notify;
 pub mod oneshot;
@@ -47,6 +48,7 @@ mod rwlock;
 mod semaphore;
 mod sync;
 
+pub use chaos::{chaos_config, init_chaos, ChaosConfig};
 pub use notify::{Notified, Notify};
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use semaphore::{AcquireError, Semaphore, SemaphorePermit};
@@ -71,12 +73,26 @@ tokio::task_local! {
 
 /// Initialize the global recorder, writing to `path`. Returns a guard that
 /// flushes and finalizes the recording when dropped. Call once per process.
+///
+/// Also arms [chaos mode](chaos) if the `WYRD_CHAOS` environment variable is
+/// set, so any shim-instrumented binary can be schedule-fuzzed (e.g. by
+/// `wyrd hunt`) without a rebuild.
 pub fn init(path: impl Into<std::path::PathBuf>) -> Result<FlushGuard, InitError> {
+    chaos::init_chaos_from_env();
     let (recorder, guard) = Recorder::builder().file(path).build()?;
     RECORDER
         .set(recorder)
         .map_err(|_| InitError::AlreadyInitialized)?;
     Ok(guard)
+}
+
+/// Like [`init`], but the recording path comes from the `WYRD_RECORD`
+/// environment variable (default: `run.wyrd`). This is the convention
+/// `wyrd hunt` uses to point each fuzzed child run at its own recording —
+/// prefer it over [`init`] in binaries you intend to hunt.
+pub fn init_from_env() -> Result<FlushGuard, InitError> {
+    let path = std::env::var("WYRD_RECORD").unwrap_or_else(|_| "run.wyrd".to_string());
+    init(path)
 }
 
 /// The wyrd task id of the currently executing [`spawn`]ed task, if any.
@@ -145,7 +161,12 @@ where
         inner: future,
         _end: TaskEndGuard { id },
     };
-    tokio::spawn(CURRENT_TASK.scope(id, instrumented))
+    tokio::spawn(CURRENT_TASK.scope(id, async move {
+        // Chaos point at task startup: perturbs which task wins the initial
+        // race to its first lock. Free when chaos is disabled.
+        chaos::chaos_point().await;
+        instrumented.await
+    }))
 }
 
 /// Emits `TaskEnd` exactly once, when the instrumented future is dropped.

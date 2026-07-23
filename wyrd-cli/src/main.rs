@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use wyrd_core::Recording;
 
 mod follow;
+mod hunt;
 mod render;
 mod tui;
 mod watch;
@@ -76,6 +77,64 @@ enum Command {
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
+    },
+    /// Detect potential deadlocks that did NOT happen: lock-order inversions
+    /// (tasks acquiring the same locks in conflicting orders) witnessed
+    /// anywhere in the recording — even a clean, passing run. Exits 2 if a
+    /// reported cycle actually deadlocked, 1 if latent cycles were found,
+    /// 0 when lock ordering is consistent.
+    Predict {
+        /// The recording file.
+        file: PathBuf,
+        /// Timestamp (ns) to evaluate at. Defaults to end-of-recording.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Longest lock-order cycle to search for.
+        #[arg(long, default_value_t = 4)]
+        max_cycle_len: usize,
+        /// At most this many cycles in the report.
+        #[arg(long, default_value_t = 16)]
+        max_cycles: usize,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fuzz a shim-instrumented command for concurrency bugs: run it many
+    /// times under different chaos seeds (WYRD_CHAOS_SEED) with a hang
+    /// watchdog, analyze every run's recording for observed deadlocks and
+    /// latent lock-order inversions, and aggregate findings across seeds.
+    /// The target should call wyrd_shim::init_from_env() (recording path
+    /// arrives via WYRD_RECORD). Exits 2 if a run hung or deadlocked, 1 if
+    /// only latent cycles were found, 0 when clean.
+    Hunt {
+        /// Number of runs (each gets seed = --seed-start + index).
+        #[arg(long, default_value_t = 16)]
+        runs: u64,
+        /// First chaos seed.
+        #[arg(long, default_value_t = 1)]
+        seed_start: u64,
+        /// Kill a run after this many seconds and count it as hung.
+        #[arg(long, default_value_t = 10.0)]
+        timeout_s: f64,
+        /// Where to write per-seed recordings (default: a temp directory;
+        /// clean runs' recordings are deleted unless --keep-clean).
+        #[arg(long)]
+        record_dir: Option<PathBuf>,
+        /// Per-site chaos injection probability (WYRD_CHAOS_PROB).
+        #[arg(long)]
+        prob: Option<f64>,
+        /// Max injected delay in microseconds (WYRD_CHAOS_MAX_DELAY_US).
+        #[arg(long)]
+        max_delay_us: Option<u64>,
+        /// Keep recordings of clean runs too.
+        #[arg(long)]
+        keep_clean: bool,
+        /// Emit the aggregate report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+        /// The command to fuzz (after `--`).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// Summarize a recording: task count, poll-time percentiles, longest parks,
     /// channel depths.
@@ -231,6 +290,55 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::Predict {
+            file,
+            at,
+            max_cycle_len,
+            max_cycles,
+            json,
+        } => {
+            let rec = Recording::open(&file)?;
+            let config = wyrd_core::model::PredictConfig {
+                max_cycle_len,
+                max_cycles,
+            };
+            let report = rec.predict(at, &config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render::render_predict(&report);
+            }
+            Ok(if report.has_observed_deadlock() {
+                ExitCode::from(2)
+            } else if report.has_potential_deadlock() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::Hunt {
+            runs,
+            seed_start,
+            timeout_s,
+            record_dir,
+            prob,
+            max_delay_us,
+            keep_clean,
+            json,
+            command,
+        } => {
+            let opts = hunt::HuntOpts {
+                runs,
+                seed_start,
+                timeout: std::time::Duration::from_secs_f64(timeout_s),
+                record_dir,
+                prob,
+                max_delay_us,
+                keep_clean,
+                json,
+            };
+            hunt::run(&command, &opts)
         }
         Command::Stats { file, top, json } => {
             let rec = Recording::open(&file)?;

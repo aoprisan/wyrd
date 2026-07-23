@@ -23,6 +23,7 @@ mod ingest;
 mod latency;
 mod lint;
 pub mod model;
+mod predict;
 mod query;
 
 use std::path::Path;
@@ -33,7 +34,10 @@ pub use diff::diff;
 pub use error::CoreError;
 pub use wyrd_weave::{ResourceId, TaskId};
 
-use model::{BlockedReport, LatencyReport, LintConfig, LintReport, Stats, TaskStatus, WorldState};
+use model::{
+    BlockedReport, LatencyReport, LintConfig, LintReport, PredictConfig, PredictReport, Stats,
+    TaskStatus, WorldState,
+};
 
 /// An ingested recording, backed by an in-memory SQLite database.
 pub struct Recording {
@@ -47,6 +51,29 @@ impl Recording {
         ingest::init_schema(&conn)?;
         ingest::ingest_file(&mut conn, path.as_ref())?;
         Ok(Self { conn })
+    }
+
+    /// Ingest a recording file, tolerating a truncated tail — the normal
+    /// shape of a recording whose process was killed mid-write (a hung or
+    /// deadlocked run under `wyrd hunt`, a crashed app, ...). Frames after the
+    /// first undecodable one are discarded; returns whether truncation was
+    /// detected alongside the recording.
+    pub fn open_lossy(path: impl AsRef<Path>) -> Result<(Self, bool), CoreError> {
+        let file = std::fs::File::open(path.as_ref()).map_err(wyrd_weave::WeaveError::from)?;
+        let mut reader = wyrd_weave::FrameReader::new(std::io::BufReader::new(file))?;
+        let mut records = Vec::new();
+        let mut truncated = false;
+        loop {
+            match reader.next_record() {
+                Ok(Some(r)) => records.push(r),
+                Ok(None) => break,
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        Ok((Self::from_records(records)?, truncated))
     }
 
     /// Ingest an in-memory sequence of records (used by tests).
@@ -93,6 +120,20 @@ impl Recording {
     pub fn lint(&self, at: Option<u64>, config: &LintConfig) -> Result<LintReport, CoreError> {
         let at = self.at_or_end(at)?;
         lint::lint(&self.conn, at, config)
+    }
+
+    /// Scan the recording (up to `at`, default: end) for **potential**
+    /// deadlocks: lock-order inversions witnessed by distinct tasks with no
+    /// common gate lock — cycles that could deadlock under another
+    /// interleaving even though this run may have completed cleanly. Cycles
+    /// that *did* deadlock in this recording are marked `observed`.
+    pub fn predict(
+        &self,
+        at: Option<u64>,
+        config: &PredictConfig,
+    ) -> Result<PredictReport, CoreError> {
+        let at = self.at_or_end(at)?;
+        predict::predict(&self.conn, at, config)
     }
 
     /// Attribute where a task's lifetime went: own poll time, resource waits
